@@ -1112,6 +1112,7 @@ function MA:BuildOverrideMap()
     self._lastActiveID = self._lastActiveID or {}
     wipe(self._activeSpellCache)
     local anyOverrideChanged = false
+    local _skipFalseAt = {}  -- EXIT-path spells: anyOverrideChanged loop must not re-stamp usableFalseAt
     for baseID in pairs(self.charDb.trackedSpells) do
         local activeID = self:GetActiveSpellID(baseID)
         self._overrideToBase[activeID] = baseID
@@ -1131,20 +1132,49 @@ function MA:BuildOverrideMap()
             local rawUsable = C_Spell.IsSpellUsable(activeID)
             local newUsable = (rawUsable == true) and true or false
             if not newUsable then
-                -- New override is NOT ready: stamp false so CheckUsability can
-                -- detect the eventual false->true when it comes off CD.
+                -- New override is NOT ready.
                 self.usableState[baseID] = false
-                self.usableFalseAt[baseID] = GetTime()
+                if activeID == baseID then
+                    -- Form EXIT, not ready: the CD frame was just cancelled so the
+                    -- spell is off-CD but resource-gated (not enough Fury).  Clear
+                    -- usableFalseAt so the 1.5s instant-flip guard doesn't eat the
+                    -- alert when Fury ticks back up.  Mark spellCastSeen so
+                    -- CheckUsability is allowed to alert.  Tell the anyOverrideChanged
+                    -- loop below to leave usableFalseAt alone for this spell.
+                    self.usableFalseAt[baseID] = nil
+                    self.spellCastSeen[baseID] = true
+                    _skipFalseAt[baseID] = true
+                else
+                    -- Form ENTRY, on real CD: stamp false time to guard against
+                    -- any instant-flip inside the new form.
+                    self.usableFalseAt[baseID] = GetTime()
+                end
             else
-                -- New override is IMMEDIATELY ready (e.g. Void Ray on Void Meta entry).
-                -- The old spell's CD context is gone, so clear the two guards that
-                -- would otherwise delay or suppress the alert:
-                --   usableFalseAt: was stamped when the OLD spell was cast; clearing it
-                --     bypasses the instant-flip guard (now - falseAt < 1.5s).
-                --   spellCastSeen: may have been consumed when the old spell last alerted;
-                --     re-arming it lets CheckUsability past the no-cast-seen gate.
-                self.usableFalseAt[baseID] = nil
-                self.spellCastSeen[baseID] = true
+                -- New override is IMMEDIATELY ready.
+                -- Distinguish form EXIT (losing override: activeID == baseID) from
+                -- form ENTRY (gaining override: activeID != baseID) so we only fire
+                -- an alert when coming OUT of the form, never going IN.
+                if activeID == baseID then
+                    -- Form EXIT: the override was lost and the base version is already
+                    -- usable.  The CD finished while we were in the form (e.g. Void Ray
+                    -- ready when Void Meta ends).  Force a false->true so CheckUsability
+                    -- fires the alert.
+                    self.usableState[baseID] = false
+                    self.usableFalseAt[baseID] = nil
+                    self.spellCastSeen[baseID] = true
+                else
+                    -- Form ENTRY: a new override was gained and it is immediately usable
+                    -- (e.g. Void Meta reset Void Ray/Collapsing Star's CD).
+                    -- Do NOT touch usableState: if it was false (spell on CD before
+                    -- Meta), leaving it false lets CheckUsability fire the alert
+                    -- immediately (Meta reset your CD — you want to know).  If it was
+                    -- already true the anyOverrideChanged loop below won't stamp it
+                    -- false either, so no spurious alert fires.
+                    -- spellCastSeen = true arms in-form casts (extra VR, CS, etc.)
+                    -- so they alert when they come off CD inside the form.
+                    self.usableFalseAt[baseID] = nil
+                    self.spellCastSeen[baseID] = true
+                end
             end
             if self.debugMode then
                 local name = C_Spell.GetSpellName(activeID) or C_Spell.GetSpellName(baseID) or tostring(baseID)
@@ -1169,7 +1199,11 @@ function MA:BuildOverrideMap()
                 local rawUsable = C_Spell.IsSpellUsable(activeID)
                 if not ((rawUsable == true) and true or false) then
                     self.usableState[baseID] = false
-                    self.usableFalseAt[baseID] = GetTime()
+                    -- Don't overwrite usableFalseAt for EXIT-path spells that
+                    -- explicitly cleared it (resource-gated on Meta exit).
+                    if not _skipFalseAt[baseID] then
+                        self.usableFalseAt[baseID] = GetTime()
+                    end
                 end
                 -- Spells that are now usable: leave usableState unchanged so
                 -- CheckCooldowns sees the false->true and fires the alert.
@@ -2319,20 +2353,23 @@ frame:SetScript("OnEvent", function(_, event, ...)
                 end
             end
         end)
-        print("|cff00ff00MochaAlerts|r v1.0.0 loaded. Type |cff88bbff/malerts|r to configure.")
+        print("|cff00ff00MochaAlerts|r v1.0.1 loaded. Type |cff88bbff/malerts|r to configure.")
 
     elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_USABLE" then
         if MA.initialized and MA.db then
             -- Rebuild override map on usability changes so form-entry re-snapshots
             -- happen before CheckCooldowns compares states.
+            local overrideChanged = false
             if event == "SPELL_UPDATE_USABLE" then
-                MA:BuildOverrideMap()
+                overrideChanged = MA:BuildOverrideMap()
             end
             -- Re-sync CD frames for recently-cast spells (cheap -- only cdCastAt set).
             pcall(MA.ReSyncCDFrames, MA)
             -- Throttle the full spell check to avoid redundant loops on rapid events.
+            -- Always bypass the throttle when an override changed (e.g. Void Meta exit)
+            -- so CheckCooldowns runs immediately even if UNIT_AURA was throttled.
             local now = GetTime()
-            if (now - MA.lastSpellCheckTime) >= 0.1 then
+            if overrideChanged or (now - MA.lastSpellCheckTime) >= 0.1 then
                 MA.lastSpellCheckTime = now
                 pcall(MA.CheckCooldowns, MA)
             end
