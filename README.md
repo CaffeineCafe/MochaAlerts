@@ -3,7 +3,7 @@
 A World of Warcraft addon that plays voice and sound alerts when your tracked spells and items come off cooldown and are ready to cast.
 
 **Author:** CaffeineCafe  
-**Version:** 1.0.0  
+**Version:** 1.1.0  
 **Interface:** 120000 (The War Within / Midnight)
 
 ---
@@ -18,6 +18,7 @@ A World of Warcraft addon that plays voice and sound alerts when your tracked sp
 - **Fleeting potion grouping** — cauldron variants and their base potions are merged into one entry automatically
 - **Spell override support** — correctly handles talent overrides and form transforms (e.g. Void Meta / Annihilation)
 - **Lockout suppression** — suppresses false alerts triggered by movement abilities like Roll and Lighter Than Air
+- **Configurable poll interval** — adjust how frequently the addon checks for cooldown changes (0.05s–0.40s) for snappier or lighter alerts
 - **Minimap button** — left-click to open settings; drag to reposition around the minimap
 - **No dependencies** — no external libraries required
 
@@ -55,6 +56,7 @@ Open the config panel with **/malerts** or by clicking the minimap icon.
 | Unlock / Lock | Enable dragging the alert frame to a new position |
 | Reset | Return the alert frame to its default position |
 | Alert scale | Resize the alert overlay (50% – 200%) |
+| Poll interval | Adjust how frequently the addon polls for cooldown changes (0.05s – 0.40s) |
 | TTS Voice | Cycle through available TTS voices; plays a preview on selection |
 | Test Alert | Fire a test voice alert |
 | Add spell or item | Input box to add by name, ID, or shift-click link |
