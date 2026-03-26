@@ -1,8 +1,8 @@
 ﻿local addonName, MA = ...
 
 -- Constants
-local ALERT_THROTTLE = 0.5
-local TTS_COALESCE_WINDOW = 0.15  -- collect simultaneous TTS for this long before speaking once
+local ALERT_THROTTLE = 0.3
+local TTS_COALESCE_WINDOW = 0.05  -- brief window to catch truly simultaneous alerts before speaking
 local DEFAULT_POLL_INTERVAL = 0.25 -- fallback before DB loads; overridden by db.pollInterval
 
 -- Defaults
@@ -773,9 +773,13 @@ end
 -- TTS (Text-to-Speech)
 -------------------------------------------------------------------------------
 function MA:GetTTSVoices()
+    if self._cachedVoices then return self._cachedVoices end
     if C_VoiceChat and C_VoiceChat.GetTtsVoices then
         local ok, voices = pcall(C_VoiceChat.GetTtsVoices)
-        if ok and voices and #voices > 0 then return voices end
+        if ok and voices and #voices > 0 then
+            self._cachedVoices = voices
+            return voices
+        end
     end
     return nil
 end
@@ -2220,7 +2224,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
                 end
             end
         end)
-        print("|cff00ff00MochaAlerts|r v1.1.1 loaded. Type |cff88bbff/malerts|r to configure.")
+        print("|cff00ff00MochaAlerts|r v1.1.2 loaded. Type |cff88bbff/malerts|r to configure.")
 
     elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_USABLE" then
         if MA.initialized and MA.db then
