@@ -13,7 +13,7 @@ local defaults = {
     alertScale = 1.0,
     alertPos = nil,  -- { point, relPoint, x, y }
     ttsVoice = 0,   -- 0-based index into C_VoiceChat.GetTtsVoices() (0 = first voice)
-    pollInterval = 0.25, -- safety-net poll interval in seconds (0.05–0.40)
+    pollInterval = 0.25, -- safety-net poll interval in seconds (0.01–0.40)
 }
 
 -- Per-character defaults
@@ -33,6 +33,7 @@ MA.alertPool = {}         -- [1..4] pool of alert frames; slot 1 = draggable anc
 MA.ttsQueue = {}          -- TTS texts queued for coalesced speak
 MA.ttsFlushPending = false -- whether a C_Timer flush is already scheduled
 MA._activeSpellCache = {} -- [baseID]  = activeID for known tracked spells; rebuilt by BuildOverrideMap
+MA.usableLiesDuringCD = {} -- [spellID] = true for spells where IsSpellUsable returns true during real CD (e.g. interrupt lockout)
 MA.lastSpellCheckTime = 0 -- GetTime() of last event-driven spell check (throttle)
 MA.lastItemCheckTime = 0  -- GetTime() of last event-driven item check (throttle)
 MA._displayTextOpen = {}  -- [rowKey] = true when the display-text edit box is open in the config UI
@@ -160,8 +161,7 @@ end)
 -- cooldown frame tracking has been replaced by polling the non-secret isActive
 -- boolean on GetSpellCooldown info.  Item CD frames are kept because
 -- GetItemCooldown returns non-secret values.
-MA.gcdEndTime = 0       -- GetTime() when GCD last completed
-MA.gcdFrame = nil       -- Cooldown frame for GCD (item tracking only)
+
 
 -- Lockout suppression: abilities like Roll/Chi Torpedo/Lighter Than Air briefly
 -- make everything unusable during movement, causing mass false alerts when the
@@ -944,6 +944,8 @@ end
 function MA:_QueueTTS(text)
     tinsert(self.ttsQueue, text)
     if not self.ttsFlushPending then
+        -- Schedule a coalesce flush so that if a second alert fires within
+        -- TTS_COALESCE_WINDOW, both get combined into one speech act.
         self.ttsFlushPending = true
         C_Timer.After(TTS_COALESCE_WINDOW, function()
             MA:_FlushTTSQueue()
@@ -1124,12 +1126,17 @@ function MA:BuildOverrideMap()
         local prevActiveID = self._lastActiveID[baseID]
         if prevActiveID and prevActiveID ~= activeID and self.usableState[baseID] ~= nil then
             anyOverrideChanged = true
-            -- Evaluate readiness for the NEW override using the same combined
-            -- check as CheckUsability: usable AND no active cooldown.
+            -- Evaluate readiness for the NEW override using the same logic
+            -- as CheckUsability (GCD-aware, cdGate-aware).
             local rawUsable = C_Spell.IsSpellUsable(activeID)
             local cdInfo = C_Spell.GetSpellCooldown(activeID)
             local cdActive = cdInfo and cdInfo.isActive
-            local newReady = (rawUsable == true) and not cdActive
+            local newReady
+            if self.usableLiesDuringCD[baseID] then
+                newReady = (rawUsable == true) and not cdActive
+            else
+                newReady = (rawUsable == true)
+            end
             if not newReady then
                 -- New override is NOT ready (on CD or not usable).
                 self.usableState[baseID] = false
@@ -1258,29 +1265,6 @@ function MA:IsOnRealCooldown(spellID)
     return cooldownInfo.isActive == true
 end
 
--------------------------------------------------------------------------------
--- GCD Frame — kept for item cooldown tracking (GetItemCooldown returns
--- non-secret values, so SetCooldown still works for items).
--- Spell CD frames have been removed: in 12.0.1+, SetCooldown no longer
--- accepts secret values from C_Spell.GetSpellCooldown.  Spell readiness is
--- now detected via the non-secret "isActive" boolean on GetSpellCooldown info.
--------------------------------------------------------------------------------
-function MA:EnsureGCDFrame()
-    if self.gcdFrame then return end
-    local f = CreateFrame("Cooldown", nil, UIParent)
-    f:SetSize(1, 1)
-    f:SetAlpha(0)
-    f:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 0, 0)
-    f:Show()
-    f:SetScript("OnCooldownDone", function()
-        MA.gcdEndTime = GetTime()
-        if MA.debugMode then
-            print("|cff88ffffMochaAlerts DBG:|r GCD done at " .. string.format("%.2f", GetTime()))
-        end
-    end)
-    self.gcdFrame = f
-end
-
 -- Called when UNIT_SPELLCAST_SUCCEEDED fires for a tracked spell
 function MA:OnSpellCast(castSpellID)
     -- Map the cast spell ID back to the tracked base spell ID
@@ -1305,11 +1289,6 @@ function MA:OnSpellCast(castSpellID)
     self.spellCastSeen[baseID] = true
 end
 
--- Spell CD frames removed in 12.0.1 (SetCooldown can't take secret values).
--- This function is now a no-op; kept so existing event handler calls don't error.
-function MA:ReSyncCDFrames()
-end
-
 -------------------------------------------------------------------------------
 -- Cooldown Tracking
 -------------------------------------------------------------------------------
@@ -1327,11 +1306,13 @@ end
 -- WoW 12.0.1+: C_Spell.GetSpellCooldown now returns a non-secret "isActive"
 -- boolean that reliably indicates whether a cooldown is being rendered.
 -- Combined with C_Spell.IsSpellUsable (also non-secret), we can definitively
--- determine spell readiness without CD frames or secret-value tricks:
---   ready = IsSpellUsable(id) AND NOT GetSpellCooldown(id).isActive
--- This handles Disrupt (interrupt lockout shows isActive=true even when
--- IsSpellUsable might lie) and Void Ray (IsSpellUsable=true once castable,
--- isActive=false once CD expires).
+-- determine spell readiness without CD frames or secret-value tricks.
+-- Most spells:  ready = IsSpellUsable(id)
+--   (isActive during GCD is IGNORED so alerts fire the instant the real CD
+--    expires, even mid-GCD.)
+-- Interrupt-like spells (auto-detected):  ready = IsSpellUsable(id) AND NOT isActive
+--   (These spells report usable=true even during a real lockout CD, so we
+--    must consult isActive to avoid false alerts.)
 -------------------------------------------------------------------------------
 function MA:CheckUsability(baseSpellID, activeID)
     activeID = activeID or self:GetActiveSpellID(baseSpellID)
@@ -1347,8 +1328,30 @@ function MA:CheckUsability(baseSpellID, activeID)
     local cdInfo = C_Spell.GetSpellCooldown(activeID)
     local cdActive = cdInfo and cdInfo.isActive
 
-    -- Combined readiness: truly usable AND no active cooldown
-    local isReady = isUsable and not cdActive
+    -- Auto-detect spells where IsSpellUsable lies during a real CD (e.g.
+    -- interrupt lockout: usable=true while cdActive=true after a confirmed cast).
+    -- Charged spells (maxCharges>1) are excluded: usable+cdActive is normal for them.
+    if isUsable and cdActive and self.spellCastSeen[baseSpellID]
+       and not self.usableLiesDuringCD[baseSpellID] then
+        local maxCharges = cdInfo and cdInfo.maxCharges or 0
+        if maxCharges <= 1 then
+            self.usableLiesDuringCD[baseSpellID] = true
+            if self.debugMode then
+                local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
+                print("|cffaa88ffMochaAlerts DBG:|r Auto-flagged " .. name .. " as usable-lies-during-CD")
+            end
+        end
+    end
+
+    -- Readiness: for most spells, IsSpellUsable alone is sufficient and lets
+    -- alerts fire mid-GCD.  For flagged spells (interrupt lockout), also
+    -- require cdActive=false to avoid false "ready" during lockout.
+    local isReady
+    if self.usableLiesDuringCD[baseSpellID] then
+        isReady = isUsable and not cdActive
+    else
+        isReady = isUsable
+    end
     local wasReady = self.usableState[baseSpellID]
 
     if self.debugMode and wasReady ~= isReady then
@@ -1378,7 +1381,7 @@ function MA:CheckUsability(baseSpellID, activeID)
         -- Post-cast bounce guard: right after a cast, APIs can briefly
         -- report usable=true / cdActive=false before the CD is fully applied.
         local falseAt = self.usableFalseAt[baseSpellID]
-        if falseAt and (now - falseAt) < 0.5 then
+        if falseAt and (now - falseAt) < 0.1 then
             if self.debugMode then
                 local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
                 print("|cffff8800MochaAlerts DBG:|r Suppressed bounce for " .. name
@@ -1516,14 +1519,10 @@ function MA:IsItemOnRealCooldown(itemID)
         if GetItemCount(itemID) == 0 then return nil end
         return false
     end
-    local ok, result = pcall(function()
-        if duration == 0 then return false end
-        -- Filter GCD (≤1.5s)
-        if duration <= 1.5 then return false end
-        return true
-    end)
-    if ok then return result end
-    return nil  -- secret values in combat
+    if duration == 0 then return false end
+    -- Filter GCD (≤1.5s)
+    if duration <= 1.5 then return false end
+    return true
 end
 
 function MA:GetItemCDFrame(itemID)
@@ -1577,38 +1576,23 @@ function MA:OnItemCast(castSpellID)
     -- upcoming false->true is a genuine CD expiry, not a rez/zone reset.
     self.itemCastSeen[itemID] = true
 
-    -- GCD frame setup: use pcall since GetSpellCooldown(61304) returns
-    -- secret values in combat and SetCooldown rejects them in 12.0.1+.
-    pcall(function()
-        MA:EnsureGCDFrame()
-        local gcdInfo = C_Spell.GetSpellCooldown(61304)
-        if gcdInfo then
-            MA.gcdFrame:SetCooldown(gcdInfo.startTime, gcdInfo.duration)
-        end
-    end)
 end
 
 function MA:ProcessItemPendingCDs()
     for itemID, doneTime in pairs(self.itemCdPending) do
-        -- Items use the same tight GCD filter as spells: only suppress when the
-        -- CD and GCD ended within ~100ms of each other.
-        if math.abs(doneTime - self.gcdEndTime) < 0.1 then
-            -- GCD, skip
-        else
-            local now = GetTime()
-            local lastAlert = self.itemLastAlert[itemID] or 0
-            if (now - lastAlert) >= 2.0 then
-                self.itemLastAlert[itemID] = now
-                if self.charDb.trackedItems[itemID] then
-                    -- Gate: only fire if a real use was seen (catches rez/zone
-                    -- resets that bypass CheckItemUsability's gate via the CD frame).
-                    if self.itemCastSeen[itemID] then
-                        self.itemCastSeen[itemID] = nil
-                        self:SpeakItem(self:GetItemDisplayName(itemID) .. " ready", itemID)
-                    elseif self.debugMode then
-                        local name = GetItemInfo(itemID) or tostring(itemID)
-                        print("|cffff8800MochaAlerts DBG:|r Suppressed no-cast-seen pending CD for " .. name)
-                    end
+        local now = GetTime()
+        local lastAlert = self.itemLastAlert[itemID] or 0
+        if (now - lastAlert) >= 2.0 then
+            self.itemLastAlert[itemID] = now
+            if self.charDb.trackedItems[itemID] then
+                -- Gate: only fire if a real use was seen (catches rez/zone
+                -- resets that bypass CheckItemUsability's gate via the CD frame).
+                if self.itemCastSeen[itemID] then
+                    self.itemCastSeen[itemID] = nil
+                    self:SpeakItem(self:GetItemDisplayName(itemID) .. " ready", itemID)
+                elseif self.debugMode then
+                    local name = GetItemInfo(itemID) or tostring(itemID)
+                    print("|cffff8800MochaAlerts DBG:|r Suppressed no-cast-seen pending CD for " .. name)
                 end
             end
         end
@@ -1706,15 +1690,33 @@ function MA:InitCooldownStates()
     wipe(self.spellCastSeen)
     wipe(self.resourceReady)
     wipe(self.lastSpellAlert)
+    wipe(self.usableLiesDuringCD)
 
     for spellID in pairs(self.charDb.trackedSpells) do
         local activeID = self:GetActiveSpellID(spellID)
         if IsPlayerSpell(spellID) or IsPlayerSpell(activeID) then
-            -- Combined readiness: usable AND no active cooldown (12.0.1+)
             local rawUsable = C_Spell.IsSpellUsable(activeID)
             local cdInfo = C_Spell.GetSpellCooldown(activeID)
             local cdActive = cdInfo and cdInfo.isActive
-            local isReady = (rawUsable == true) and not cdActive
+
+            -- Auto-detect interrupt-like spells at init: usable=true while
+            -- cdActive=true (e.g. Disrupt during lockout).  Exclude charged
+            -- spells where that combination is normal.
+            if rawUsable and cdActive then
+                local maxCharges = cdInfo and cdInfo.maxCharges or 0
+                if maxCharges <= 1 then
+                    self.usableLiesDuringCD[spellID] = true
+                end
+            end
+
+            -- Readiness: ignore GCD for normal spells; require cdActive
+            -- check only for flagged spells.
+            local isReady
+            if self.usableLiesDuringCD[spellID] then
+                isReady = (rawUsable == true) and not cdActive
+            else
+                isReady = (rawUsable == true)
+            end
             self.usableState[spellID] = isReady
             -- Stamp false-at so any immediate post-init transition (e.g. a port
             -- resetting a cooldown) is caught by the bounce guard.
@@ -2125,8 +2127,6 @@ frame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 frame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 frame:RegisterEvent("SPELLS_CHANGED")
 frame:RegisterEvent("BAG_UPDATE_COOLDOWN")
-frame:RegisterEvent("ZONE_CHANGED")
-frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 
 frame:SetScript("OnEvent", function(_, event, ...)
@@ -2220,7 +2220,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
                 end
             end
         end)
-        print("|cff00ff00MochaAlerts|r v1.1.0 loaded. Type |cff88bbff/malerts|r to configure.")
+        print("|cff00ff00MochaAlerts|r v1.1.1 loaded. Type |cff88bbff/malerts|r to configure.")
 
     elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_USABLE" then
         if MA.initialized and MA.db then
@@ -2234,7 +2234,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             -- Always bypass the throttle when an override changed (e.g. Void Meta exit)
             -- so CheckCooldowns runs immediately even if UNIT_AURA was throttled.
             local now = GetTime()
-            if overrideChanged or (now - MA.lastSpellCheckTime) >= 0.1 then
+            if overrideChanged or (now - MA.lastSpellCheckTime) >= 0.05 then
                 MA.lastSpellCheckTime = now
                 pcall(MA.CheckCooldowns, MA)
             end
@@ -2244,7 +2244,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
         if MA.initialized and MA.db then
             pcall(MA.ReSyncItemCDFrames, MA)
             local now = GetTime()
-            if (now - MA.lastItemCheckTime) >= 0.1 then
+            if (now - MA.lastItemCheckTime) >= 0.05 then
                 MA.lastItemCheckTime = now
                 pcall(MA.CheckItemCooldowns, MA)
             end
@@ -2302,7 +2302,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             local now = GetTime()
             -- Always check immediately on an override change (e.g. Void Meta entry)
             -- so spells that just became ready don't wait for the throttle window.
-            if overrideChanged or (now - MA.lastSpellCheckTime) >= 0.1 then
+            if overrideChanged or (now - MA.lastSpellCheckTime) >= 0.05 then
                 MA.lastSpellCheckTime = now
                 pcall(MA.CheckCooldowns, MA)
             end
@@ -2327,14 +2327,17 @@ frame:SetScript("OnEvent", function(_, event, ...)
             end
         end
 
-    -- Prevent alerts on zone changes: reset state but do not trigger alerts
-    elseif event == "ZONE_CHANGED" or event == "ZONE_CHANGED_NEW_AREA" or event == "PLAYER_ENTERING_WORLD" then
+    -- Prevent alerts after loading screens (instances, portals, login).
+    -- ZONE_CHANGED and ZONE_CHANGED_NEW_AREA are NOT reset here because they
+    -- fire constantly while flying between subzones/zones, causing false alerts
+    -- (spells are briefly not-usable during flight → InitCooldownStates arms
+    -- spellCastSeen → transition fires when API settles).
+    elseif event == "PLAYER_ENTERING_WORLD" then
         if MA.initialized and MA.db then
             MA:InitCooldownStates()
             MA:InitItemStates()
-            -- Do NOT call CheckCooldowns/CheckItemCooldowns here (would trigger alerts)
             if MA.debugMode then
-                print("|cff00ff00MochaAlerts DBG:|r State reset on zone change (", event, ")")
+                print("|cff00ff00MochaAlerts DBG:|r State reset on", event)
             end
         end
     end
@@ -2522,7 +2525,8 @@ SlashCmdList["MochaAlerts"] = function(msg)
                 local usable = C_Spell.IsSpellUsable(spellID)
                 local onCD = MA:IsOnRealCooldown(spellID)
                 local usState = MA.usableState[spellID]
-                print("  " .. name .. " [" .. spellID .. "] known=" .. tostring(known) .. " usable=" .. tostring(usable) .. " onCD=" .. tostring(onCD) .. " state=" .. tostring(usState))
+                local liesFlag = MA.usableLiesDuringCD[spellID] and true or false
+                print("  " .. name .. " [" .. spellID .. "] known=" .. tostring(known) .. " usable=" .. tostring(usable) .. " onCD=" .. tostring(onCD) .. " state=" .. tostring(usState) .. " cdGate=" .. tostring(liesFlag))
             end
         end
 
