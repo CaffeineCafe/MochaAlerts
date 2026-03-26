@@ -3,7 +3,7 @@
 -- Constants
 local ALERT_THROTTLE = 0.5
 local TTS_COALESCE_WINDOW = 0.15  -- collect simultaneous TTS for this long before speaking once
-local POLL_INTERVAL = 0.3  -- safety-net poll; events are the primary mechanism
+local DEFAULT_POLL_INTERVAL = 0.25 -- fallback before DB loads; overridden by db.pollInterval
 
 -- Defaults
 local defaults = {
@@ -13,6 +13,7 @@ local defaults = {
     alertScale = 1.0,
     alertPos = nil,  -- { point, relPoint, x, y }
     ttsVoice = 0,   -- 0-based index into C_VoiceChat.GetTtsVoices() (0 = first voice)
+    pollInterval = 0.25, -- safety-net poll interval in seconds (0.05–0.40)
 }
 
 -- Per-character defaults
@@ -2338,22 +2339,23 @@ frame:SetScript("OnEvent", function(_, event, ...)
         -- when events have been quiet (avoids redundant work in combat).
         frame:SetScript("OnUpdate", function(_, dt)
             MA.elapsed = MA.elapsed + dt
-            if MA.elapsed >= POLL_INTERVAL then
+            local poll = (MA.db and MA.db.pollInterval) or DEFAULT_POLL_INTERVAL
+            if MA.elapsed >= poll then
                 MA.elapsed = 0
                 if MA.initialized and MA.db then
                     local now = GetTime()
-                    if (now - MA.lastSpellCheckTime) >= POLL_INTERVAL then
+                    if (now - MA.lastSpellCheckTime) >= poll then
                         MA.lastSpellCheckTime = now
                         pcall(MA.CheckCooldowns, MA)
                     end
-                    if (now - MA.lastItemCheckTime) >= POLL_INTERVAL then
+                    if (now - MA.lastItemCheckTime) >= poll then
                         MA.lastItemCheckTime = now
                         pcall(MA.CheckItemCooldowns, MA)
                     end
                 end
             end
         end)
-        print("|cff00ff00MochaAlerts|r v1.0.1 loaded. Type |cff88bbff/malerts|r to configure.")
+        print("|cff00ff00MochaAlerts|r v1.1.0 loaded. Type |cff88bbff/malerts|r to configure.")
 
     elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_USABLE" then
         if MA.initialized and MA.db then
