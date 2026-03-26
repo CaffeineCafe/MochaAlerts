@@ -155,12 +155,13 @@ f:SetScript("OnEvent", function()
     CreateMinimapButton()
 end)
 
--- Cooldown frame tracking (combat-safe for CD-based spells like Disrupt)
-MA.cdFrames = {}        -- [spellID] = Cooldown frame widget
-MA.cdPending = {}       -- [spellID] = GetTime() when OnCooldownDone fired
-MA.cdCastAt = {}        -- [spellID] = GetTime() when spell was cast (for post-cast bounce guard)
+-- NOTE: In WoW 12.0.1+, SetCooldown() no longer accepts secret values from
+-- C_Spell.GetSpellCooldown (only SetCooldownFromDurationObject does).  Spell
+-- cooldown frame tracking has been replaced by polling the non-secret isActive
+-- boolean on GetSpellCooldown info.  Item CD frames are kept because
+-- GetItemCooldown returns non-secret values.
 MA.gcdEndTime = 0       -- GetTime() when GCD last completed
-MA.gcdFrame = nil       -- Cooldown frame for GCD
+MA.gcdFrame = nil       -- Cooldown frame for GCD (item tracking only)
 
 -- Lockout suppression: abilities like Roll/Chi Torpedo/Lighter Than Air briefly
 -- make everything unusable during movement, causing mass false alerts when the
@@ -1113,38 +1114,31 @@ function MA:BuildOverrideMap()
     self._lastActiveID = self._lastActiveID or {}
     wipe(self._activeSpellCache)
     local anyOverrideChanged = false
-    local _skipFalseAt = {}  -- EXIT-path spells: anyOverrideChanged loop must not re-stamp usableFalseAt
     for baseID in pairs(self.charDb.trackedSpells) do
         local activeID = self:GetActiveSpellID(baseID)
         self._overrideToBase[activeID] = baseID
         self._overrideToBase[baseID] = baseID
 
         -- If the active spell ID changed (override gained/lost), re-snapshot
-        -- usability and cancel the stale CD frame to prevent double alerts.
+        -- readiness so the mode change doesn't trigger a false alert.
         local prevActiveID = self._lastActiveID[baseID]
         if prevActiveID and prevActiveID ~= activeID and self.usableState[baseID] ~= nil then
             anyOverrideChanged = true
-            -- Cancel the old CD frame so it doesn't fire OnCooldownDone for
-            -- a cooldown that was reset by the form entry (Void Meta, etc.).
-            local f = self.cdFrames[baseID]
-            if f then f:SetCooldown(0, 0) end
-            self.cdPending[baseID] = nil
-            self.cdCastAt[baseID] = nil
+            -- Evaluate readiness for the NEW override using the same combined
+            -- check as CheckUsability: usable AND no active cooldown.
             local rawUsable = C_Spell.IsSpellUsable(activeID)
-            local newUsable = (rawUsable == true) and true or false
-            if not newUsable then
-                -- New override is NOT ready.
+            local cdInfo = C_Spell.GetSpellCooldown(activeID)
+            local cdActive = cdInfo and cdInfo.isActive
+            local newReady = (rawUsable == true) and not cdActive
+            if not newReady then
+                -- New override is NOT ready (on CD or not usable).
                 self.usableState[baseID] = false
                 if activeID == baseID then
-                    -- Form EXIT, not ready: the CD frame was just cancelled so the
-                    -- spell is off-CD but resource-gated (not enough Fury).  Clear
-                    -- usableFalseAt so the 1.5s instant-flip guard doesn't eat the
-                    -- alert when Fury ticks back up.  Mark spellCastSeen so
-                    -- CheckUsability is allowed to alert.  Tell the anyOverrideChanged
-                    -- loop below to leave usableFalseAt alone for this spell.
+                    -- Form EXIT, not ready: spell is off-CD but resource-gated
+                    -- (e.g. not enough Fury).  Clear usableFalseAt so the
+                    -- bounce guard doesn't eat the alert when resource ticks up.
                     self.usableFalseAt[baseID] = nil
                     self.spellCastSeen[baseID] = true
-                    _skipFalseAt[baseID] = true
                 else
                     -- Form ENTRY, on real CD: stamp false time to guard against
                     -- any instant-flip inside the new form.
@@ -1152,63 +1146,36 @@ function MA:BuildOverrideMap()
                 end
             else
                 -- New override is IMMEDIATELY ready.
-                -- Distinguish form EXIT (losing override: activeID == baseID) from
-                -- form ENTRY (gaining override: activeID != baseID) so we only fire
-                -- an alert when coming OUT of the form, never going IN.
                 if activeID == baseID then
-                    -- Form EXIT: the override was lost and the base version is already
-                    -- usable.  The CD finished while we were in the form (e.g. Void Ray
-                    -- ready when Void Meta ends).  Force a false->true so CheckUsability
-                    -- fires the alert.
+                    -- Form EXIT: the override was lost and the base version is
+                    -- already ready (CD finished while in form, e.g. Void Ray
+                    -- ready when Void Meta ends).  Force false so CheckUsability
+                    -- sees the false->true transition and fires the alert.
                     self.usableState[baseID] = false
                     self.usableFalseAt[baseID] = nil
                     self.spellCastSeen[baseID] = true
                 else
-                    -- Form ENTRY: a new override was gained and it is immediately usable
-                    -- (e.g. Void Meta reset Void Ray/Collapsing Star's CD).
-                    -- Do NOT touch usableState: if it was false (spell on CD before
-                    -- Meta), leaving it false lets CheckUsability fire the alert
-                    -- immediately (Meta reset your CD — you want to know).  If it was
-                    -- already true the anyOverrideChanged loop below won't stamp it
-                    -- false either, so no spurious alert fires.
-                    -- spellCastSeen = true arms in-form casts (extra VR, CS, etc.)
-                    -- so they alert when they come off CD inside the form.
+                    -- Form ENTRY: a new override was gained and it is immediately
+                    -- ready (e.g. Void Meta reset Void Ray/Collapsing Star's CD).
+                    -- Leave usableState as-is: if false, CheckUsability will alert
+                    -- (Meta reset your CD — you want to know).  If already true,
+                    -- no spurious alert fires.
                     self.usableFalseAt[baseID] = nil
                     self.spellCastSeen[baseID] = true
                 end
             end
             if self.debugMode then
                 local name = C_Spell.GetSpellName(activeID) or C_Spell.GetSpellName(baseID) or tostring(baseID)
-                print("|cffff8800MochaAlerts DBG:|r Override changed for " .. name .. " [" .. baseID .. "]: " .. tostring(prevActiveID) .. " -> " .. tostring(activeID) .. ", newUsable=" .. tostring(newUsable) .. " (usableState left=" .. tostring(self.usableState[baseID]) .. ")")
+                print("|cffff8800MochaAlerts DBG:|r Override changed for " .. name .. " [" .. baseID .. "]: "
+                    .. tostring(prevActiveID) .. " -> " .. tostring(activeID)
+                    .. ", newReady=" .. tostring(newReady)
+                    .. " (usableState=" .. tostring(self.usableState[baseID]) .. ")")
             end
         end
         self._lastActiveID[baseID] = activeID
         -- Cache for CheckCooldowns: avoids GetActiveSpellID + IsPlayerSpell*2 per check.
         if IsPlayerSpell(baseID) or IsPlayerSpell(activeID) then
             self._activeSpellCache[baseID] = activeID
-        end
-    end
-    -- If any override changed (form entry/exit), re-snapshot ALL tracked spells.
-    -- This prevents adjacent cooldown resets (e.g. Darkness) from firing false
-    -- alerts when Void Meta resets multiple spells simultaneously.
-    -- Only stamp false; spells that are now ready keep their existing false state
-    -- so CheckCooldowns can detect the false->true transition and alert.
-    if anyOverrideChanged then
-        for baseID in pairs(self.charDb.trackedSpells) do
-            if self.usableState[baseID] ~= nil then
-                local activeID = self:GetActiveSpellID(baseID)
-                local rawUsable = C_Spell.IsSpellUsable(activeID)
-                if not ((rawUsable == true) and true or false) then
-                    self.usableState[baseID] = false
-                    -- Don't overwrite usableFalseAt for EXIT-path spells that
-                    -- explicitly cleared it (resource-gated on Meta exit).
-                    if not _skipFalseAt[baseID] then
-                        self.usableFalseAt[baseID] = GetTime()
-                    end
-                end
-                -- Spells that are now usable: leave usableState unchanged so
-                -- CheckCooldowns sees the false->true and fires the alert.
-            end
         end
     end
     return anyOverrideChanged
@@ -1287,66 +1254,17 @@ function MA:IsOnRealCooldown(spellID)
     local activeID = self:GetActiveSpellID(spellID)
     local cooldownInfo = C_Spell.GetSpellCooldown(activeID)
     if not cooldownInfo then return false end
-
-    local ok, result = pcall(function()
-        if cooldownInfo.duration == 0 then return false end
-        -- Compare against the global cooldown (spell 61304)
-        local gcdInfo = C_Spell.GetSpellCooldown(61304)
-        if gcdInfo and gcdInfo.duration > 0
-           and cooldownInfo.startTime == gcdInfo.startTime
-           and cooldownInfo.duration == gcdInfo.duration then
-            return false -- just the GCD, not a real cooldown
-        end
-        return true
-    end)
-
-    if ok then return result end
-    return nil -- secret values in combat, can't determine
+    -- 12.0.1+: isActive is non-secret and true when a real CD is displayed.
+    return cooldownInfo.isActive == true
 end
 
 -------------------------------------------------------------------------------
--- Cooldown Frame Tracking (combat-safe)
--- SetCooldown() accepts secret values. OnCooldownDone fires when the C++ timer
--- completes. We defer alerts by one frame so we can compare against GCD.
+-- GCD Frame — kept for item cooldown tracking (GetItemCooldown returns
+-- non-secret values, so SetCooldown still works for items).
+-- Spell CD frames have been removed: in 12.0.1+, SetCooldown no longer
+-- accepts secret values from C_Spell.GetSpellCooldown.  Spell readiness is
+-- now detected via the non-secret "isActive" boolean on GetSpellCooldown info.
 -------------------------------------------------------------------------------
-function MA:GetCDFrame(spellID)
-    if self.cdFrames[spellID] then return self.cdFrames[spellID] end
-    local f = CreateFrame("Cooldown", nil, UIParent)
-    f:SetSize(1, 1)
-    f:SetAlpha(0)
-    f:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 0, 0)
-    f:Show()
-    local sid = spellID
-    f:SetScript("OnCooldownDone", function()
-        local now = GetTime()
-        MA.cdPending[sid] = now
-        -- If spell was cast and this CD frame fired well after (>2s),
-        -- this is a real CD end, not just a GCD. Force usableState to
-        -- false so CheckUsability detects the false->true transition.
-        -- Handles spells where IsSpellUsable stays true during real CD
-        -- (e.g., Void Ray in Meta/Voidform).
-        local castAt = MA.cdCastAt[sid]
-        if castAt and (now - castAt) > 2.0 then
-            MA.usableState[sid] = false
-            MA.cdCastAt[sid] = nil
-        end
-        -- CD frame fired = real cooldown ended this session; mark as cast-seen
-        -- so CheckUsability can alert even if zone wiped the original OnSpellCast.
-        -- Only re-arm when usableState is still false; if CheckUsability already fired
-        -- an alert and updated state to true, don't re-arm (prevents double-alert).
-        if MA.usableState[sid] == false then
-            MA.spellCastSeen[sid] = true
-        end
-        pcall(MA.CheckUsability, MA, sid)
-        if MA.debugMode then
-            local name = C_Spell.GetSpellName(sid) or tostring(sid)
-            print("|cff88ffffMochaAlerts DBG:|r OnCooldownDone: " .. name .. " at " .. string.format("%.2f", GetTime()))
-        end
-    end)
-    self.cdFrames[spellID] = f
-    return f
-end
-
 function MA:EnsureGCDFrame()
     if self.gcdFrame then return end
     local f = CreateFrame("Cooldown", nil, UIParent)
@@ -1359,41 +1277,8 @@ function MA:EnsureGCDFrame()
         if MA.debugMode then
             print("|cff88ffffMochaAlerts DBG:|r GCD done at " .. string.format("%.2f", GetTime()))
         end
-        -- Immediately process any spells whose real CD expired during this GCD
-        -- so they alert the moment the GCD ends rather than waiting for the next poll.
-        pcall(MA.ProcessPendingCDs, MA)
     end)
     self.gcdFrame = f
-end
-
--- Called from OnUpdate to process deferred CD completions
-function MA:ProcessPendingCDs()
-    for spellID, doneTime in pairs(self.cdPending) do
-        -- GCD filter: suppress only when the CD and GCD ended within ~100ms of each
-        -- other, which means the CD was GCD-only (no real cooldown of its own).
-        -- A real CD that expired DURING an active GCD has doneTime meaningfully
-        -- earlier than gcdEndTime — allow it through so it alerts immediately
-        -- once ProcessPendingCDs is called from EnsureGCDFrame's OnCooldownDone.
-        if math.abs(doneTime - self.gcdEndTime) < 0.1 then
-            -- Ended simultaneously with GCD — this was a GCD-only cooldown, skip
-        else
-            -- Real cooldown ended — fire alert (with per-spell throttle)
-            local now = GetTime()
-            local lastAlert = self.lastSpellAlert[spellID] or 0
-            if (now - lastAlert) >= ALERT_THROTTLE then
-                self.lastSpellAlert[spellID] = now
-                local activeID = self._activeSpellCache[spellID] or self:GetActiveSpellID(spellID)
-                local spellName = C_Spell.GetSpellName(activeID) or C_Spell.GetSpellName(spellID)
-                if spellName and self.charDb.trackedSpells[spellID] then
-                    if self.debugMode then
-                        print("|cff00ff00MochaAlerts DBG:|r CD done: " .. spellName .. " (doneAt=" .. string.format("%.2f", doneTime) .. " gcdAt=" .. string.format("%.2f", self.gcdEndTime) .. ")")
-                    end
-                    self:Speak(spellName .. " ready", spellID)
-                end
-            end
-        end
-        self.cdPending[spellID] = nil
-    end
 end
 
 -- Called when UNIT_SPELLCAST_SUCCEEDED fires for a tracked spell
@@ -1408,54 +1293,21 @@ function MA:OnSpellCast(castSpellID)
         print("|cff88ffffMochaAlerts DBG:|r CAST: " .. name .. " [" .. castSpellID .. "] (base: " .. baseName .. " [" .. baseID .. "])")
     end
 
-    -- Force usableState to false on cast so any immediate bounce
-    -- (IsSpellUsable returning true during real CD) doesn't bypass detection
+    -- Force usableState to false on cast so the false->true transition
+    -- in CheckUsability fires when the CD actually expires.
     self.usableState[baseID] = false
+    -- Stamp usableFalseAt so the post-cast bounce guard in CheckUsability
+    -- can filter brief API bounces right after casting.
+    self.usableFalseAt[baseID] = GetTime()
     -- Mark that we observed a real cast this session so CheckUsability
     -- knows the upcoming false->true is a genuine CD expiry, not a
     -- zone-change / rez / form-reset that externally reset the cooldown.
     self.spellCastSeen[baseID] = true
-
-    -- Record cast time for the post-cast bounce guard in CheckUsability
-    -- (IsSpellUsable can momentarily return true before the CD is applied).
-    self.cdCastAt[baseID] = GetTime()
-
-    -- Set up spell CD frame using the CAST spell ID (SetCooldown accepts secret values)
-    local info = C_Spell.GetSpellCooldown(castSpellID)
-    if info then
-        local f = self:GetCDFrame(baseID)
-        f:SetCooldown(info.startTime, info.duration)
-    end
-
-    -- Set up GCD frame for comparison
-    self:EnsureGCDFrame()
-    local gcdInfo = C_Spell.GetSpellCooldown(61304)
-    if gcdInfo then
-        self.gcdFrame:SetCooldown(gcdInfo.startTime, gcdInfo.duration)
-    end
 end
 
--- Re-sync CD frames for recently-cast spells only (cdCastAt set).
--- These are the frames that may have received secret values in OnSpellCast and
--- need the real duration once SPELL_UPDATE_COOLDOWN delivers it.
+-- Spell CD frames removed in 12.0.1 (SetCooldown can't take secret values).
+-- This function is now a no-op; kept so existing event handler calls don't error.
 function MA:ReSyncCDFrames()
-    for baseID in pairs(self.cdCastAt) do
-        if self.charDb.trackedSpells[baseID] then
-            local activeID = self._activeSpellCache[baseID] or self:GetActiveSpellID(baseID)
-            local info = C_Spell.GetSpellCooldown(activeID)
-            if info then
-                local f = self.cdFrames[baseID]
-                if f then f:SetCooldown(info.startTime, info.duration) end
-            end
-        end
-    end
-    -- Always re-sync the GCD frame (needed for ProcessPendingCDs GCD comparison).
-    if self.gcdFrame then
-        local gcdInfo = C_Spell.GetSpellCooldown(61304)
-        if gcdInfo then
-            self.gcdFrame:SetCooldown(gcdInfo.startTime, gcdInfo.duration)
-        end
-    end
 end
 
 -------------------------------------------------------------------------------
@@ -1467,87 +1319,100 @@ function MA:CheckCooldowns()
         self:CheckUsability(baseSpellID, activeID)
         pcall(self.CheckResource, self, baseSpellID)
     end
-    self:ProcessPendingCDs()
 end
 
 -------------------------------------------------------------------------------
 -- Usability Tracking (primary mechanism — works in AND out of combat)
--- C_Spell.IsSpellUsable returns false when: on cooldown, not enough resource,
--- not enough charges, missing proc, etc. Returns true when castable.
--- This is the ONLY combat-safe detection since it avoids secret number comparisons.
+--
+-- WoW 12.0.1+: C_Spell.GetSpellCooldown now returns a non-secret "isActive"
+-- boolean that reliably indicates whether a cooldown is being rendered.
+-- Combined with C_Spell.IsSpellUsable (also non-secret), we can definitively
+-- determine spell readiness without CD frames or secret-value tricks:
+--   ready = IsSpellUsable(id) AND NOT GetSpellCooldown(id).isActive
+-- This handles Disrupt (interrupt lockout shows isActive=true even when
+-- IsSpellUsable might lie) and Void Ray (IsSpellUsable=true once castable,
+-- isActive=false once CD expires).
 -------------------------------------------------------------------------------
 function MA:CheckUsability(baseSpellID, activeID)
     activeID = activeID or self:GetActiveSpellID(baseSpellID)
+
     -- Query usability on the ACTIVE (possibly overridden) spell ID
     local rawUsable = C_Spell.IsSpellUsable(activeID)
     local isUsable = (rawUsable == true) and true or false
 
-    local wasUsable = self.usableState[baseSpellID]
+    -- Query the non-secret isActive boolean from cooldown info (12.0.1+)
+    -- isActive is true when a cooldown should be displayed:
+    --   regular CD: isEnabled and startTime > 0 and duration > 0
+    --   charge CD:  maxCharges > 1 and currentCharges < maxCharges and start > 0 and dur > 0
+    local cdInfo = C_Spell.GetSpellCooldown(activeID)
+    local cdActive = cdInfo and cdInfo.isActive
 
-    if self.debugMode and wasUsable ~= isUsable then
+    -- Combined readiness: truly usable AND no active cooldown
+    local isReady = isUsable and not cdActive
+    local wasReady = self.usableState[baseSpellID]
+
+    if self.debugMode and wasReady ~= isReady then
         local name = C_Spell.GetSpellName(activeID) or C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
-        print("|cffaa88ffMochaAlerts DBG:|r [" .. baseSpellID .. "/" .. activeID .. "] " .. name .. " usable: " .. tostring(wasUsable) .. " -> " .. tostring(isUsable))
+        print("|cffaa88ffMochaAlerts DBG:|r [" .. baseSpellID .. "/" .. activeID .. "] " .. name
+            .. " ready: " .. tostring(wasReady) .. " -> " .. tostring(isReady)
+            .. " (usable=" .. tostring(isUsable) .. ", cdActive=" .. tostring(cdActive) .. ")")
     end
 
-    -- Alert on not-usable -> usable transition
-    if isUsable and wasUsable == false then
-        -- Primary gate: only alert if we observed a real cast (or CD frame
-        -- expiry) this session.  Zone changes, rezes, and form-resets can all
-        -- flip a spell from not-usable -> usable without any cast occurring;
-        -- spellCastSeen is wiped by InitCooldownStates so those transitions
-        -- are transparently suppressed regardless of how long they take.
+    -- Alert on not-ready -> ready transition
+    if isReady and wasReady == false then
+        -- Primary gate: only alert if we observed a real cast this session.
+        -- Zone changes, rezes, and form-resets can flip a spell from
+        -- not-ready -> ready without any cast; spellCastSeen is wiped by
+        -- InitCooldownStates so those transitions are suppressed.
         if not self.spellCastSeen[baseSpellID] then
             if self.debugMode then
                 local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
                 print("|cffff8800MochaAlerts DBG:|r Suppressed no-cast-seen alert for " .. name)
             end
-            self.usableState[baseSpellID] = isUsable
+            self.usableState[baseSpellID] = isReady
             return
         end
-        -- Consume the cast-seen flag; cleared here so a second external reset
-        -- after a real cast doesn't sneak through.
-        self.spellCastSeen[baseSpellID] = nil
-        -- Secondary guard: instant flip (< 1.5s) catches Void Meta resetting a
-        -- spell that was JUST cast (so spellCastSeen was set) within the same GCD.
+
         local now = GetTime()
-        local falseAt = self.usableFalseAt[baseSpellID] or 0
-        if (now - falseAt) < 1.5 then
+
+        -- Post-cast bounce guard: right after a cast, APIs can briefly
+        -- report usable=true / cdActive=false before the CD is fully applied.
+        local falseAt = self.usableFalseAt[baseSpellID]
+        if falseAt and (now - falseAt) < 0.5 then
             if self.debugMode then
                 local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
-                print("|cffff8800MochaAlerts DBG:|r Suppressed instant-flip alert for " .. name .. " (false for " .. string.format("%.2f", now - falseAt) .. "s)")
+                print("|cffff8800MochaAlerts DBG:|r Suppressed bounce for " .. name
+                    .. " (not-ready for " .. string.format("%.2f", now - falseAt) .. "s)")
             end
-            self.usableState[baseSpellID] = isUsable
+            -- Don't update state — wait for a real transition
             return
         end
-        local castAt = self.cdCastAt[baseSpellID]
-        if castAt and (now - castAt) < 2.0 then
-            self.usableState[baseSpellID] = isUsable
-            return
-        end
+
+        -- Consume the cast-seen flag; cleared so a second external reset
+        -- after a real cast doesn't sneak through.
+        self.spellCastSeen[baseSpellID] = nil
+
         -- Skip if inside lockout suppression window (Roll, Chi Torpedo, etc.)
-        -- Extend lockout if Lighter Than Air buff is still active
         local hasLTA = self:HasLTABuff()
         if now < self.lockoutUntil or hasLTA then
             if self.debugMode then
                 print("|cffff8800MochaAlerts DBG:|r Suppressed alert (lockout=" .. string.format("%.1f", self.lockoutUntil - now) .. "s remaining, LTA=" .. tostring(hasLTA) .. ")")
             end
             if hasLTA then
-                -- Extend lockout to cover full LTA float; never shorten
                 local newUntil = now + 6.0
                 if newUntil > self.lockoutUntil then
                     self.lockoutUntil = newUntil
                 end
             end
-            -- Don't alert, but DO update state so the transition is consumed
-            self.usableState[baseSpellID] = isUsable
+            self.usableState[baseSpellID] = isReady
             return
         end
+
         local lastAlert = self.lastSpellAlert[baseSpellID] or 0
         if (now - lastAlert) >= ALERT_THROTTLE then
             self.lastSpellAlert[baseSpellID] = now
-            self.cdPending[baseSpellID] = nil  -- prevent ProcessPendingCDs double-fire
-            -- Use the active (override) spell name so transforms like Void Meta -> Collapsing Star
-            -- alert with the spell name the player currently sees on their action bar.
+            -- Use the active (override) spell name so transforms like
+            -- Void Meta -> Collapsing Star alert with the visible name.
             local spellName = C_Spell.GetSpellName(activeID) or C_Spell.GetSpellName(baseSpellID)
             if spellName then
                 self:Speak(spellName .. " ready", baseSpellID)
@@ -1555,12 +1420,12 @@ function MA:CheckUsability(baseSpellID, activeID)
         end
     end
 
-    -- Record when this spell transitions to not-usable so the min-false-duration
-    -- check above can filter form-reset flips.
-    if not isUsable and wasUsable ~= false then
+    -- Record when this spell transitions to not-ready so the bounce guard
+    -- can filter brief post-cast API bounces.
+    if not isReady and wasReady ~= false then
         self.usableFalseAt[baseSpellID] = GetTime()
     end
-    self.usableState[baseSpellID] = isUsable
+    self.usableState[baseSpellID] = isReady
 end
 
 -------------------------------------------------------------------------------
@@ -1712,11 +1577,15 @@ function MA:OnItemCast(castSpellID)
     -- upcoming false->true is a genuine CD expiry, not a rez/zone reset.
     self.itemCastSeen[itemID] = true
 
-    self:EnsureGCDFrame()
-    local gcdInfo = C_Spell.GetSpellCooldown(61304)
-    if gcdInfo then
-        self.gcdFrame:SetCooldown(gcdInfo.startTime, gcdInfo.duration)
-    end
+    -- GCD frame setup: use pcall since GetSpellCooldown(61304) returns
+    -- secret values in combat and SetCooldown rejects them in 12.0.1+.
+    pcall(function()
+        MA:EnsureGCDFrame()
+        local gcdInfo = C_Spell.GetSpellCooldown(61304)
+        if gcdInfo then
+            MA.gcdFrame:SetCooldown(gcdInfo.startTime, gcdInfo.duration)
+        end
+    end)
 end
 
 function MA:ProcessItemPendingCDs()
@@ -1835,22 +1704,24 @@ function MA:InitCooldownStates()
     wipe(self.usableState)
     wipe(self.usableFalseAt)
     wipe(self.spellCastSeen)
-    wipe(self.cdCastAt)
     wipe(self.resourceReady)
     wipe(self.lastSpellAlert)
 
     for spellID in pairs(self.charDb.trackedSpells) do
         local activeID = self:GetActiveSpellID(spellID)
         if IsPlayerSpell(spellID) or IsPlayerSpell(activeID) then
-            -- Normalize to real Lua boolean, query on active ID
+            -- Combined readiness: usable AND no active cooldown (12.0.1+)
             local rawUsable = C_Spell.IsSpellUsable(activeID)
-            self.usableState[spellID] = (rawUsable == true) and true or false
+            local cdInfo = C_Spell.GetSpellCooldown(activeID)
+            local cdActive = cdInfo and cdInfo.isActive
+            local isReady = (rawUsable == true) and not cdActive
+            self.usableState[spellID] = isReady
             -- Stamp false-at so any immediate post-init transition (e.g. a port
-            -- resetting a cooldown) is caught by the min-false-duration gate.
-            if self.usableState[spellID] == false then
+            -- resetting a cooldown) is caught by the bounce guard.
+            if not isReady then
                 self.usableFalseAt[spellID] = GetTime()
-                -- Spell was on CD at init: pre-arm so its first expiry alerts.
-                -- (spellCastSeen stays nil for spells that start true, which
+                -- Spell was not ready at init: pre-arm so its first expiry alerts.
+                -- (spellCastSeen stays nil for spells that start ready, which
                 --  blocks false "ready" alerts caused by rez/port state resets.)
                 self.spellCastSeen[spellID] = true
             end
@@ -1927,12 +1798,6 @@ function MA:RemoveSpell(spellID)
     self.spellCastSeen[spellID] = nil
     self.resourceReady[spellID] = nil
     self.lastSpellAlert[spellID] = nil
-    self.cdPending[spellID] = nil
-    self.cdCastAt[spellID] = nil
-    if self.cdFrames[spellID] then
-        self.cdFrames[spellID]:SetCooldown(0, 0)
-        self.cdFrames[spellID] = nil
-    end
     print("|cff00ff00MochaAlerts:|r Removed " .. spellName)
     if self.configFrame and self.configFrame:IsShown() then
         self:RefreshSpellList()
@@ -2365,8 +2230,6 @@ frame:SetScript("OnEvent", function(_, event, ...)
             if event == "SPELL_UPDATE_USABLE" then
                 overrideChanged = MA:BuildOverrideMap()
             end
-            -- Re-sync CD frames for recently-cast spells (cheap -- only cdCastAt set).
-            pcall(MA.ReSyncCDFrames, MA)
             -- Throttle the full spell check to avoid redundant loops on rapid events.
             -- Always bypass the throttle when an override changed (e.g. Void Meta exit)
             -- so CheckCooldowns runs immediately even if UNIT_AURA was throttled.
