@@ -1,5 +1,19 @@
 ﻿local addonName, MA = ...
 
+-- Upvalue hot-path globals (avoids global table lookups on every poll tick)
+local GetTime = GetTime
+local InCombatLockdown = InCombatLockdown
+local IsPlayerSpell = IsPlayerSpell
+local C_Spell = C_Spell
+local C_Timer = C_Timer
+local pairs = pairs
+local ipairs = ipairs
+local type = type
+local wipe = wipe
+local pcall = pcall
+local tinsert = tinsert
+local tconcat = table.concat
+
 -- Constants
 local ALERT_THROTTLE = 0.3
 local TTS_COALESCE_WINDOW = 0.05  -- brief window to catch truly simultaneous alerts before speaking
@@ -14,6 +28,8 @@ local defaults = {
     alertPos = nil,  -- { point, relPoint, x, y }
     ttsVoice = 0,   -- 0-based index into C_VoiceChat.GetTtsVoices() (0 = first voice)
     pollInterval = 0.25, -- safety-net poll interval in seconds (0.01–0.40)
+    alertFont = nil, -- nil = default Friz Quadrata; otherwise a FontMagic font path
+    alertColor = {r = 0, g = 1, b = 0}, -- visual alert text color (default green)
 }
 
 -- Per-character defaults
@@ -34,6 +50,10 @@ MA.ttsQueue = {}          -- TTS texts queued for coalesced speak
 MA.ttsFlushPending = false -- whether a C_Timer flush is already scheduled
 MA._activeSpellCache = {} -- [baseID]  = activeID for known tracked spells; rebuilt by BuildOverrideMap
 MA.usableLiesDuringCD = {} -- [spellID] = true for spells where IsSpellUsable returns true during real CD (e.g. interrupt lockout)
+MA.chargeCount = {}       -- [baseSpellID] = last known currentCharges (only for spells with maxCharges > 1)
+MA._chargeTimers = {}     -- [baseSpellID] = C_Timer handle for per-charge recovery detection
+MA._chargeRechargeDur = {} -- [baseSpellID] = per-charge recharge duration in seconds (cached at init, out of combat)
+MA._chargedSpells = {}    -- [baseSpellID] = maxCharges, cached at init (out of combat) so we never need secret-value APIs at runtime
 MA.lastSpellCheckTime = 0 -- GetTime() of last event-driven spell check (throttle)
 MA.lastItemCheckTime = 0  -- GetTime() of last event-driven item check (throttle)
 MA._displayTextOpen = {}  -- [rowKey] = true when the display-text edit box is open in the config UI
@@ -156,11 +176,11 @@ f:SetScript("OnEvent", function()
     CreateMinimapButton()
 end)
 
--- NOTE: In WoW 12.0.1+, SetCooldown() no longer accepts secret values from
--- C_Spell.GetSpellCooldown (only SetCooldownFromDurationObject does).  Spell
--- cooldown frame tracking has been replaced by polling the non-secret isActive
--- boolean on GetSpellCooldown info.  Item CD frames are kept because
--- GetItemCooldown returns non-secret values.
+-- NOTE: In WoW 12.0.1+, neither SetCooldown() nor SetCooldownFromDurationObject()
+-- accept the Lua table from C_Spell.GetSpellCooldown (secret value restrictions).
+-- Spell readiness is detected by polling the non-secret isActive boolean.
+-- Charged spell recovery uses C_Timer with cached recharge durations.
+-- Item CD frames still work because GetItemCooldown returns non-secret values.
 
 
 -- Lockout suppression: abilities like Roll/Chi Torpedo/Lighter Than Air briefly
@@ -189,6 +209,113 @@ MA.itemCdFrames = {}        -- [itemID] = Cooldown frame widget
 MA.itemCdPending = {}       -- [itemID] = GetTime() when OnCooldownDone fired
 MA.itemSpellMap = {}        -- [itemID] = spellID resolved from GetItemSpell
 MA.itemSpellReverse = {}    -- [spellID] = itemID reverse lookup for cast detection
+
+-------------------------------------------------------------------------------
+-- Font Library (sourced from FontMagic addon)
+-------------------------------------------------------------------------------
+MA.FontLib = {}  -- { { name = "Display Name", path = "Interface\\...\\file.ttf", category = "Popular" }, ... }
+MA.DEFAULT_FONT = "Fonts\\FRIZQT__.TTF"
+
+do
+    local FM_PATH = "Interface\\AddOns\\FontMagic\\"
+    -- Mirror FontMagic's category→folder mapping
+    local FM_GROUPS = {
+        { category = "Popular",          folder = "Popular" },
+        { category = "Clean & Readable", folder = "Easy-to-Read" },
+        { category = "Bold & Impact",    folder = "BoldImpact" },
+        { category = "Fantasy & RP",     folder = "Fun" },
+        { category = "Sci-Fi & Tech",    folder = "Future" },
+        { category = "Random",           folder = "Random" },
+    }
+    -- Font files per folder (must match FontMagic's shipped files)
+    local FM_FONTS = {
+        ["Popular"] = {
+            "Pepsi.ttf", "bignoodletitling.ttf", "Expressway.ttf", "Bangers.ttf", "PTSansNarrow-Bold.ttf", "Roboto Condensed Bold.ttf",
+            "NotoSans_Condensed-Bold.ttf", "Roboto-Bold.ttf", "AlteHaasGroteskBold.ttf", "CalibriBold.ttf", "Orbitron.ttf", "Prototype.ttf",
+            "914Solid.ttf", "Halo.ttf", "Proxima Nova Condensed Bold.ttf", "Comfortaa-Bold.ttf", "Andika-Bold.ttf", "lemon-milk.ttf",
+            "Good Brush.ttf", "KG HAPPY.ttf",
+        },
+        ["Easy-to-Read"] = {
+            "BauhausRegular.ttf", "Butterpop.ttf", "Diogenes.ttf", "Junegull.ttf", "Pantalone.ttf", "Resoft.ttf",
+            "Retro Amour.ttf", "SF-Pro.ttf", "Solange.ttf", "Takeaway.ttf",
+        },
+        ["BoldImpact"] = {
+            "airstrikebold.ttf", "Blazed.ttf", "DieDieDie.ttf", "graff.ttf", "Green Fuz.otf", "Love Craft.ttf",
+            "modernwarfare.ttf", "Showpop.ttf", "Skratchpunk.ttf", "Skullphabet.ttf", "Trashco.ttf", "Whiplash.ttf",
+        },
+        ["Fun"] = {
+            "Acadian.ttf", "akash.ttf", "Caesar.ttf", "ComicRunes.ttf", "crygords.ttf", "Deltarune.ttf",
+            "Elven.ttf", "Gunung.ttf", "Guroes.ttf", "HarryP.ttf", "Hobbit.ttf", "Kting.ttf",
+            "leviathans.ttf", "MystikOrbs.ttf", "Odinson.ttf", "ParryHotter.ttf", "Pau.ttf", "Pokemon.ttf",
+            "Runic.ttf", "Runy.ttf", "Ruritania.ttf", "Spongebob.ttf", "Starborn.ttf", "Starshines.ttf",
+            "The Centurion .ttf", "Vampire Wars.ttf", "VTKS.ttf", "WaltographUI.ttf", "Wasser.ttf", "Wickedmouse.ttf",
+            "WKnight.ttf", "Zombie.ttf",
+        },
+        ["Future"] = {
+            "04b.ttf", "albra.TTF", "Audiowide.ttf", "continuum.ttf", "dalek.ttf", "digital-7.ttf",
+            "Digital.ttf", "Exocet.ttf", "Galaxyone.ttf", "Minecrafter.Reg.ttf", "pf_tempesta_seven.ttf", "Price.ttf",
+            "RaceSpace.ttf", "RushDriver.ttf", "space age.ttf", "Terminator.ttf",
+        },
+        ["Random"] = {
+            "accidentalpres.ttf", "animeace.ttf", "Barriecito.ttf", "baskethammer.ttf", "ChopSic.ttf", "college.ttf",
+            "Disko.ttf", "Dmagic.ttf", "edgyh.ttf", "edkies.ttf", "FastHand.ttf", "figtoen.ttf",
+            "font2.ttf", "Fraks.ttf", "Ginko.ttf", "Homespun.ttf", "IKARRG.TTF", "JJSTS.TTF",
+            "KOMIKAX_.ttf", "Ktingw.ttf", "Melted.ttf", "Midorima.ttf", "Munsteria.ttf", "Rebuffed.TTF",
+            "Shiruken.ttf", "shog.ttf", "Starcine.ttf", "Stentiga.ttf", "tsuchigumo.ttf", "WhoAsksSatan.ttf",
+        },
+    }
+    -- Strip extension and normalize display name (mirrors FontMagic's __fmShortenFontLabel)
+    local function StripFontName(fname)
+        local s = fname:gsub("%.[Tt][Tt][Ff]$", ""):gsub("%.[Oo][Tt][Ff]$", "")
+        s = s:gsub("[_%-]+", " ")
+        s = s:gsub("(%l)(%u)", "%1 %2")
+        s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        return s
+    end
+    for _, group in ipairs(FM_GROUPS) do
+        local files = FM_FONTS[group.folder]
+        if files then
+            for _, fname in ipairs(files) do
+                local path = FM_PATH .. group.folder .. "\\" .. fname
+                tinsert(MA.FontLib, {
+                    name = StripFontName(fname),
+                    path = path,
+                    category = group.category,
+                })
+            end
+        end
+    end
+end
+
+function MA:GetAlertFontPath()
+    return (self.db and self.db.alertFont) or self.DEFAULT_FONT
+end
+
+function MA:GetAlertColor()
+    local c = self.db and self.db.alertColor
+    if c then return c.r, c.g, c.b end
+    return 0, 1, 0
+end
+
+function MA:SetAlertColor(r, g, b)
+    self.db.alertColor = {r = r, g = g, b = b}
+end
+
+function MA:GetAlertColorHex()
+    local r, g, b = self:GetAlertColor()
+    return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
+end
+
+function MA:SetAlertFont(path)
+    self.db.alertFont = (path ~= self.DEFAULT_FONT) and path or nil
+    local fontPath = path or self.DEFAULT_FONT
+    -- Update all existing alert frames
+    for _, f in ipairs(self.alertPool) do
+        if f.text then
+            f.text:SetFont(fontPath, 24, "OUTLINE")
+        end
+    end
+end
 
 -------------------------------------------------------------------------------
 -- Sound Library
@@ -592,7 +719,7 @@ function MA:CreateAlertFrame()
         f.icon = icon
 
         local text = f:CreateFontString(nil, "OVERLAY")
-        text:SetFont("Fonts\\FRIZQT__.TTF", 24, "OUTLINE")
+        text:SetFont(self:GetAlertFontPath(), 24, "OUTLINE")
         text:SetPoint("TOP", f, "CENTER", 0, -2)
         f.text = text
 
@@ -785,30 +912,29 @@ function MA:GetTTSVoices()
 end
 
 function MA:GetSelectedVoice()
+    if self._cachedSelectedVoice then return self._cachedSelectedVoice end
     local voices = self:GetTTSVoices()
     if not voices then return nil end
-    local idx = (self.db.ttsVoice or 0) + 1  -- saved as 0-based, Lua tables are 1-based
-    return voices[idx] or voices[1]
+    local idx = (self.db.ttsVoice or 0) + 1
+    local voice = voices[idx] or voices[1]
+    self._cachedSelectedVoice = voice
+    return voice
 end
 
 function MA:TryTTS(text)
+    local voice = self:GetSelectedVoice()
     -- Method 1: TextToSpeech_Speak with the actual voice OBJECT (not ID)
-    if TextToSpeech_Speak then
-        local voice = self:GetSelectedVoice()
-        if voice then
-            local ok, err = pcall(TextToSpeech_Speak, text, voice)
-            if self.debugMode then
-                print("|cff00ff00MochaAlerts DBG:|r TTS Method1 (TextToSpeech_Speak + voiceObj): ok=" .. tostring(ok) .. " err=" .. tostring(err))
-            end
-            if ok then return true end
+    if TextToSpeech_Speak and voice then
+        local ok, err = pcall(TextToSpeech_Speak, text, voice)
+        if self.debugMode then
+            print("|cff00ff00MochaAlerts DBG:|r TTS Method1 (TextToSpeech_Speak + voiceObj): ok=" .. tostring(ok) .. " err=" .. tostring(err))
         end
+        if ok then return true end
     end
 
     -- Method 2: Direct C_VoiceChat.SpeakText with voice object's voiceID
     if C_VoiceChat and C_VoiceChat.SpeakText then
-        local voice = self:GetSelectedVoice()
         local vid = voice and voice.voiceID or 0
-        -- Enum.VoiceTtsDestination: LocalPlayback=0, QueuedLocalPlayback=1, RemoteTransmission=2
         local ok, err = pcall(C_VoiceChat.SpeakText, vid, text, 0, 0, 100)
         if self.debugMode then
             print("|cff00ff00MochaAlerts DBG:|r TTS Method2 (SpeakText vid=" .. vid .. "): ok=" .. tostring(ok) .. " err=" .. tostring(err))
@@ -941,26 +1067,44 @@ end
 
 -------------------------------------------------------------------------------
 -- TTS Coalescing Queue
--- Collecting all simultaneous TTS requests into one speech act avoids the
--- engine queuing them sequentially, which causes the second spell name to be
--- delayed until the first finishes speaking.
+-- The FIRST alert in a burst is spoken immediately (zero latency).  If a
+-- second alert arrives within TTS_COALESCE_WINDOW of that first one, the
+-- engine is stopped and both are re-spoken as a combined string.  This avoids
+-- the old 50ms delay on every single alert while still coalescing true
+-- simultaneous bursts ("Void Ray, Collapsing Star").
 -------------------------------------------------------------------------------
 function MA:_QueueTTS(text)
     tinsert(self.ttsQueue, text)
     if not self.ttsFlushPending then
-        -- Schedule a coalesce flush so that if a second alert fires within
-        -- TTS_COALESCE_WINDOW, both get combined into one speech act.
+        -- First alert in this burst: speak it NOW (zero latency).
+        -- Also start a short coalesce window — if a second alert arrives
+        -- before the timer fires, we stop the first speech and re-speak
+        -- the combined string.
         self.ttsFlushPending = true
+        self:_FlushTTSQueue(true)  -- true = immediate flush (keep window open)
         C_Timer.After(TTS_COALESCE_WINDOW, function()
-            MA:_FlushTTSQueue()
+            if #MA.ttsQueue > 0 then
+                -- More alerts arrived during the window; re-speak combined.
+                MA:_FlushTTSQueue(false)
+            else
+                MA.ttsFlushPending = false
+            end
         end)
+    else
+        -- A second (or third) alert arrived while the coalesce window is open.
+        -- Stop the in-progress single speech so the timer re-speaks combined.
+        if C_VoiceChat and C_VoiceChat.StopSpeakingText then
+            pcall(C_VoiceChat.StopSpeakingText)
+        end
     end
 end
 
-function MA:_FlushTTSQueue()
-    self.ttsFlushPending = false
+function MA:_FlushTTSQueue(keepWindow)
+    if not keepWindow then
+        self.ttsFlushPending = false
+    end
     if #self.ttsQueue == 0 then return end
-    local combined = table.concat(self.ttsQueue, ", ")
+    local combined = tconcat(self.ttsQueue, ", ")
     wipe(self.ttsQueue)
     if self.debugMode then
         print("|cff00ff00MochaAlerts DBG:|r TTS flush: '" .. combined .. "'")
@@ -995,22 +1139,21 @@ function MA:Speak(text, spellID)
         print("|cff00ff00MochaAlerts DBG:|r >>> " .. text)
     end
 
-    -- Per-spell mode: TTS, sound, or none
-    local mode = spellID and self:GetSpellMode(spellID) or "tts"
+    -- Per-spell mode and custom TTS text (single table lookup)
+    local data = spellID and self.charDb.trackedSpells[spellID]
+    local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
-        -- Queue for coalescing: if another spell ready in the same burst,
-        -- they'll be combined into one TTS call ("Void Ray, Darkness")
-        local ttsText = spellID and self:GetSpellTTSText(spellID) or nil
+        local ttsText = (type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil
         self:_QueueTTS(ttsText or text)
     elseif mode ~= "none" then
-        local soundKey = spellID and self:GetSpellSound(spellID) or "RaidWarning"
+        local soundKey = (type(data) == "table" and data.sound) or "RaidWarning"
         self:PlaySoundByKey(soundKey)
     end
 
     -- Visual feedback (custom frame is safe during combat)
     if self.db.showVisual then
-        local visText = (spellID and self:GetSpellDisplayText(spellID)) or text
-        self:ShowAlertText("|cff00ff00" .. visText .. "|r", spellID, nil)
+        local visText = (type(data) == "table" and data.displayText ~= "" and data.displayText) or text
+        self:ShowAlertText(self:GetAlertColorHex() .. visText .. "|r", spellID, nil)
     end
 
     -- Double-alert: schedule a second fire after 1.5s when x2 is enabled
@@ -1024,16 +1167,17 @@ function MA:_SpeakRaw(text, spellID)
     if not self.db or not self.db.enabled then return end
     if not self.db.alertInCombat and InCombatLockdown() then return end
     self.lastAlertTime[text] = GetTime()
-    local mode = spellID and self:GetSpellMode(spellID) or "tts"
+    local data = spellID and self.charDb.trackedSpells[spellID]
+    local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
-        local ttsText = spellID and self:GetSpellTTSText(spellID) or nil
+        local ttsText = (type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil
         self:_QueueTTS(ttsText or text)
     elseif mode ~= "none" then
-        self:PlaySoundByKey(spellID and self:GetSpellSound(spellID) or "RaidWarning")
+        self:PlaySoundByKey((type(data) == "table" and data.sound) or "RaidWarning")
     end
     if self.db.showVisual then
-        local visText = (spellID and self:GetSpellDisplayText(spellID)) or text
-        self:ShowAlertText("|cff00ff00" .. visText .. "|r", spellID, nil)
+        local visText = (type(data) == "table" and data.displayText ~= "" and data.displayText) or text
+        self:ShowAlertText(self:GetAlertColorHex() .. visText .. "|r", spellID, nil)
     end
 end
 
@@ -1062,8 +1206,8 @@ function MA:SpeakItem(text, itemID)
     end
 
     if self.db.showVisual then
-        local visText = (itemID and self:GetItemDisplayText(itemID)) or text
-        self:ShowAlertText("|cff00ff00" .. visText .. "|r", nil, itemID)
+        local visText = self:GetItemDisplayText(itemID) or text
+        self:ShowAlertText(self:GetAlertColorHex() .. visText .. "|r", nil, itemID)
     end
 
     -- Double-alert: schedule a second fire after 1.5s when x2 is enabled
@@ -1085,7 +1229,7 @@ function MA:_SpeakItemRaw(text, itemID)
     end
     if self.db.showVisual then
         local visText = (itemID and self:GetItemDisplayText(itemID)) or text
-        self:ShowAlertText("|cff00ff00" .. visText .. "|r", nil, itemID)
+        self:ShowAlertText(self:GetAlertColorHex() .. visText .. "|r", nil, itemID)
     end
 end
 
@@ -1130,14 +1274,23 @@ function MA:BuildOverrideMap()
         local prevActiveID = self._lastActiveID[baseID]
         if prevActiveID and prevActiveID ~= activeID and self.usableState[baseID] ~= nil then
             anyOverrideChanged = true
-            -- Evaluate readiness for the NEW override using the same logic
-            -- as CheckUsability (GCD-aware, cdGate-aware).
+            -- Evaluate readiness for the NEW override using the same
+            -- logic as CheckUsability.
             local rawUsable = C_Spell.IsSpellUsable(activeID)
             local cdInfo = C_Spell.GetSpellCooldown(activeID)
             local cdActive = cdInfo and cdInfo.isActive
             local newReady
             if self.usableLiesDuringCD[baseID] then
-                newReady = (rawUsable == true) and not cdActive
+                if not (rawUsable == true) then
+                    newReady = false
+                elseif not cdActive then
+                    newReady = true
+                else
+                    -- isUsable + cdActive: could be GCD or real lockout.
+                    -- Preserve current state.
+                    local prev = self.usableState[baseID]
+                    newReady = (prev == nil) and false or prev
+                end
             else
                 newReady = (rawUsable == true)
             end
@@ -1241,25 +1394,13 @@ function MA:BuildLockoutSet()
 end
 
 function MA:HasLTABuff()
-    local ok, result = pcall(function()
-        for _, auraID in ipairs(LTA_SPELL_IDS) do
-            if C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID then
-                local aura = C_UnitAuras.GetPlayerAuraBySpellID(auraID)
-                if aura then return true end
-            end
-            local name = C_Spell.GetSpellName(auraID)
-            if name then
-                local aura = AuraUtil.FindAuraByName(name, "player", "HELPFUL")
-                if aura then return true end
-            end
-        end
-        return false
-    end)
-    if ok then return result end
-    return false  -- assume no LTA if check fails in combat
+    if not C_UnitAuras or not C_UnitAuras.GetPlayerAuraBySpellID then return false end
+    for _, auraID in ipairs(LTA_SPELL_IDS) do
+        if C_UnitAuras.GetPlayerAuraBySpellID(auraID) then return true end
+    end
+    return false
 end
 
--------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
 function MA:IsOnRealCooldown(spellID)
     local activeID = self:GetActiveSpellID(spellID)
@@ -1267,6 +1408,96 @@ function MA:IsOnRealCooldown(spellID)
     if not cooldownInfo then return false end
     -- 12.0.1+: isActive is non-secret and true when a real CD is displayed.
     return cooldownInfo.isActive == true
+end
+
+---------------------------------------------------------------------------
+-- Timer-based per-charge recovery detection.
+-- CooldownFrame + SetCooldown/SetCooldownFromDurationObject can't work
+-- because spell startTime/duration are secret in combat.  Instead we cache
+-- the per-charge recharge duration at init (out of combat) and use
+-- C_Timer.NewTimer after each cast to schedule recovery callbacks.
+---------------------------------------------------------------------------
+function MA:ArmChargeWatch(baseSpellID, forceNew)
+    -- If a timer is already running and we're not forcing a new one, leave it.
+    if self._chargeTimers[baseSpellID] and not forceNew then
+        if self.debugMode then
+            local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
+            print("|cffaa88ffMochaAlerts DBG:|r ArmChargeWatch: " .. name .. " timer already running, skipping")
+        end
+        return
+    end
+
+    -- Cancel any stale timer.
+    if self._chargeTimers[baseSpellID] then
+        self._chargeTimers[baseSpellID]:Cancel()
+        self._chargeTimers[baseSpellID] = nil
+    end
+
+    local rechargeDur = self._chargeRechargeDur[baseSpellID]
+    if not rechargeDur or rechargeDur <= 0 then
+        if self.debugMode then
+            local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
+            print("|cffff8800MochaAlerts DBG:|r ArmChargeWatch: " .. name .. " no cached recharge duration, skipping")
+        end
+        return
+    end
+
+    -- Out of combat we can calculate the exact remaining time.
+    local remaining = rechargeDur
+    if not InCombatLockdown() then
+        local activeID = self._activeSpellCache[baseSpellID] or self:GetActiveSpellID(baseSpellID)
+        local chargeInfo = C_Spell.GetSpellCharges(activeID)
+        if not chargeInfo then chargeInfo = C_Spell.GetSpellCharges(baseSpellID) end
+        if chargeInfo and chargeInfo.cooldownStartTime and chargeInfo.cooldownDuration
+           and chargeInfo.cooldownDuration > 0 then
+            remaining = (chargeInfo.cooldownStartTime + chargeInfo.cooldownDuration) - GetTime()
+        end
+    end
+
+    if remaining <= 0.05 then return end  -- already recovered
+
+    self._chargeTimers[baseSpellID] = C_Timer.NewTimer(remaining, function()
+        self._chargeTimers[baseSpellID] = nil
+        MA:OnChargeRecovered(baseSpellID)
+    end)
+
+    if self.debugMode then
+        local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
+        print("|cffaa88ffMochaAlerts DBG:|r Armed charge timer for " .. name .. " (" .. string.format("%.1f", remaining) .. "s)")
+    end
+end
+
+function MA:OnChargeRecovered(baseSpellID)
+    if not self.spellCastSeen[baseSpellID] then return end
+
+    local maxCharges = self._chargedSpells[baseSpellID]
+    if not maxCharges then return end
+
+    local prev = self.chargeCount[baseSpellID] or 0
+    local newCount = prev + 1
+    if newCount > maxCharges then newCount = maxCharges end
+    self.chargeCount[baseSpellID] = newCount
+    self.usableState[baseSpellID] = newCount > 0
+
+    -- Alert
+    local now = GetTime()
+    local lastAlert = self.lastSpellAlert[baseSpellID] or 0
+    if (now - lastAlert) >= ALERT_THROTTLE then
+        self.lastSpellAlert[baseSpellID] = now
+        local activeID = self._activeSpellCache[baseSpellID] or self:GetActiveSpellID(baseSpellID)
+        local spellName = C_Spell.GetSpellName(activeID) or C_Spell.GetSpellName(baseSpellID)
+        if spellName then
+            if self.debugMode then
+                print("|cffaa88ffMochaAlerts DBG:|r Charge recovered (timer): " .. spellName .. " (" .. prev .. " -> " .. newCount .. "/" .. maxCharges .. ")")
+            end
+            self:Speak(spellName .. " ready", baseSpellID)
+        end
+    end
+
+    -- If still recharging, re-arm for the next charge recovery (full duration).
+    if newCount < maxCharges then
+        self:ArmChargeWatch(baseSpellID, true)  -- force new timer
+    end
 end
 
 -- Called when UNIT_SPELLCAST_SUCCEEDED fires for a tracked spell
@@ -1281,26 +1512,84 @@ function MA:OnSpellCast(castSpellID)
         print("|cff88ffffMochaAlerts DBG:|r CAST: " .. name .. " [" .. castSpellID .. "] (base: " .. baseName .. " [" .. baseID .. "])")
     end
 
-    -- Force usableState to false on cast so the false->true transition
-    -- in CheckUsability fires when the CD actually expires.
-    self.usableState[baseID] = false
-    -- Stamp usableFalseAt so the post-cast bounce guard in CheckUsability
-    -- can filter brief API bounces right after casting.
-    self.usableFalseAt[baseID] = GetTime()
-    -- Mark that we observed a real cast this session so CheckUsability
-    -- knows the upcoming false->true is a genuine CD expiry, not a
-    -- zone-change / rez / form-reset that externally reset the cooldown.
-    self.spellCastSeen[baseID] = true
+    -- Determine if this spell has multiple charges.
+    -- GetSpellCharges/GetSpellCooldown return secret proxies in combat that
+    -- break comparisons, so we use the _chargedSpells cache (seeded at init).
+    local maxCh = self._chargedSpells[baseID]
+
+    -- Runtime fallback: if not cached, check cdInfo.maxCharges (non-secret,
+    -- accurate when the spell is on CD).
+    if not maxCh then
+        local cdInfo = C_Spell.GetSpellCooldown(baseID)
+        if cdInfo and cdInfo.maxCharges and cdInfo.maxCharges > 1 then
+            maxCh = cdInfo.maxCharges
+            self._chargedSpells[baseID] = maxCh
+            if self.debugMode then
+                local name = C_Spell.GetSpellName(baseID) or tostring(baseID)
+                print("|cff88ffffMochaAlerts DBG:|r Runtime detected " .. name .. " as charged (" .. maxCh .. " max) from OnSpellCast")
+            end
+        end
+    end
+
+    if maxCh then
+        -- Charged spell: decrement our internal counter.
+        -- currentCharges is secret in combat, so we use chargeCount instead.
+        -- Out of combat OnSpellCast fires before the charge is deducted,
+        -- so we use our counter which was last synced by CheckUsability.
+        local prev = self.chargeCount[baseID] or maxCh
+        local afterCast = prev - 1
+        if afterCast < 0 then afterCast = 0 end
+        self.chargeCount[baseID] = afterCast
+        self.spellCastSeen[baseID] = true
+        if afterCast < 1 then
+            -- All charges spent — spell truly becomes not-ready.
+            self.usableState[baseID] = false
+            self.usableFalseAt[baseID] = GetTime()
+        end
+        if self.debugMode then
+            print("|cff88ffffMochaAlerts DBG:|r Charged spell cast: " .. afterCast .. "/" .. maxCh .. " charges remain")
+        end
+        -- Start a charge recovery timer.
+        -- Only force a new timer when we were at max charges (new recharge cycle).
+        -- Otherwise let the existing timer run for the current recharge.
+        local wasAtMax = (prev == maxCh)
+        if wasAtMax or not self._chargeTimers[baseID] then
+            self:ArmChargeWatch(baseID, true)  -- force new timer
+        end
+    else
+        -- Non-charged spell: force usableState to false on cast so the
+        -- false->true transition in CheckUsability fires when the CD expires.
+        self.usableState[baseID] = false
+        self.usableFalseAt[baseID] = GetTime()
+        self.spellCastSeen[baseID] = true
+    end
 end
 
 -------------------------------------------------------------------------------
 -- Cooldown Tracking
 -------------------------------------------------------------------------------
+
+-- GetSpellCooldown().maxCharges is unreliable for some charged spells (reports 0).
+-- GetSpellCharges() is the authoritative source.
+local function GetSpellMaxCharges(spellID)
+    local chargeInfo = C_Spell.GetSpellCharges(spellID)
+    if chargeInfo and chargeInfo.maxCharges and chargeInfo.maxCharges > 1 then
+        return chargeInfo.maxCharges
+    end
+    local cdInfo = C_Spell.GetSpellCooldown(spellID)
+    return cdInfo and cdInfo.maxCharges or 0
+end
+
 function MA:CheckCooldowns()
-    -- _activeSpellCache is built by BuildOverrideMap; avoids per-call API overhead.
     for baseSpellID, activeID in pairs(self._activeSpellCache) do
         self:CheckUsability(baseSpellID, activeID)
-        pcall(self.CheckResource, self, baseSpellID)
+    end
+    -- Resource thresholds only work out of combat (UnitPower returns secret values).
+    -- Skipping this loop in combat avoids per-spell function call overhead.
+    if not InCombatLockdown() then
+        for baseSpellID in pairs(self._activeSpellCache) do
+            self:CheckResource(baseSpellID)
+        end
     end
 end
 
@@ -1312,11 +1601,10 @@ end
 -- Combined with C_Spell.IsSpellUsable (also non-secret), we can definitively
 -- determine spell readiness without CD frames or secret-value tricks.
 -- Most spells:  ready = IsSpellUsable(id)
---   (isActive during GCD is IGNORED so alerts fire the instant the real CD
---    expires, even mid-GCD.)
--- Interrupt-like spells (auto-detected):  ready = IsSpellUsable(id) AND NOT isActive
---   (These spells report usable=true even during a real lockout CD, so we
---    must consult isActive to avoid false alerts.)
+--   (GCD is irrelevant — alerts fire the instant the real CD expires.)
+-- Interrupt-like spells (auto-detected):  usable=true even during lockout,
+--   so when isUsable+cdActive we preserve the prior state (could be GCD).
+--   OnSpellCast forces usableState=false for real casts.
 -------------------------------------------------------------------------------
 function MA:CheckUsability(baseSpellID, activeID)
     activeID = activeID or self:GetActiveSpellID(baseSpellID)
@@ -1332,27 +1620,101 @@ function MA:CheckUsability(baseSpellID, activeID)
     local cdInfo = C_Spell.GetSpellCooldown(activeID)
     local cdActive = cdInfo and cdInfo.isActive
 
+    -- Check if this is a charged spell from our init-time cache.
+    -- GetSpellCharges returns secret proxies in combat; the cache is reliable.
+    local maxCharges = self._chargedSpells[baseSpellID] or 0
+
+    -- Runtime fallback: cdInfo.maxCharges (non-secret in 12.0.1+) is accurate
+    -- when the spell is actively on CD.  Some charged spells report maxCharges=0
+    -- when fully charged (off CD), so init may miss them.  Detect them here.
+    if maxCharges <= 1 and cdInfo and cdInfo.maxCharges and cdInfo.maxCharges > 1 then
+        maxCharges = cdInfo.maxCharges
+        self._chargedSpells[baseSpellID] = maxCharges
+        -- Also un-flag usableLiesDuringCD if it was incorrectly set.
+        self.usableLiesDuringCD[baseSpellID] = nil
+        if self.debugMode then
+            local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
+            print("|cffaa88ffMochaAlerts DBG:|r Runtime detected " .. name .. " as charged (" .. maxCharges .. " max)")
+        end
+    end
+
     -- Auto-detect spells where IsSpellUsable lies during a real CD (e.g.
     -- interrupt lockout: usable=true while cdActive=true after a confirmed cast).
     -- Charged spells (maxCharges>1) are excluded: usable+cdActive is normal for them.
     if isUsable and cdActive and self.spellCastSeen[baseSpellID]
-       and not self.usableLiesDuringCD[baseSpellID] then
-        local maxCharges = cdInfo and cdInfo.maxCharges or 0
-        if maxCharges <= 1 then
-            self.usableLiesDuringCD[baseSpellID] = true
-            if self.debugMode then
-                local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
-                print("|cffaa88ffMochaAlerts DBG:|r Auto-flagged " .. name .. " as usable-lies-during-CD")
-            end
+       and not self.usableLiesDuringCD[baseSpellID]
+       and maxCharges <= 1 then
+        self.usableLiesDuringCD[baseSpellID] = true
+        if self.debugMode then
+            local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
+            print("|cffaa88ffMochaAlerts DBG:|r Auto-flagged " .. name .. " as usable-lies-during-CD")
         end
     end
 
+    ---------------------------------------------------------------------------
+    -- Charged spell handling: alert on charge RECOVERY, not on use.
+    -- In combat: C_Timer (armed in OnSpellCast) fires after the cached
+    --   per-charge recharge duration.
+    -- Out of combat: we sync from the real currentCharges value.
+    ---------------------------------------------------------------------------
+    if maxCharges > 1 then
+        local prevCount = self.chargeCount[baseSpellID]
+
+        -- Out of combat: sync from the real value (currentCharges is readable).
+        if not InCombatLockdown() then
+            local chargeInfo = C_Spell.GetSpellCharges(activeID)
+            if not chargeInfo then chargeInfo = C_Spell.GetSpellCharges(baseSpellID) end
+            if chargeInfo and chargeInfo.currentCharges then
+                local cur = chargeInfo.currentCharges
+                -- Keep recharge duration cached for in-combat timers (haste may change).
+                if chargeInfo.cooldownDuration and chargeInfo.cooldownDuration > 0 then
+                    self._chargeRechargeDur[baseSpellID] = chargeInfo.cooldownDuration
+                end
+                -- Detect recovery: count went UP since last check
+                if prevCount and cur > prevCount and self.spellCastSeen[baseSpellID] then
+                    local now = GetTime()
+                    local lastAlert = self.lastSpellAlert[baseSpellID] or 0
+                    if (now - lastAlert) >= ALERT_THROTTLE then
+                        self.lastSpellAlert[baseSpellID] = now
+                        local spellName = C_Spell.GetSpellName(activeID) or C_Spell.GetSpellName(baseSpellID)
+                        if spellName then
+                            if self.debugMode then
+                                print("|cffaa88ffMochaAlerts DBG:|r Charge recovered: " .. spellName .. " (" .. prevCount .. " -> " .. cur .. "/" .. maxCharges .. ")")
+                            end
+                            self:Speak(spellName .. " ready", baseSpellID)
+                        end
+                    end
+                end
+                self.chargeCount[baseSpellID] = cur
+                self.usableState[baseSpellID] = isUsable and cur > 0
+            end
+        end
+        -- In combat: C_Timer handles recovery detection (see ArmChargeWatch).
+        -- Just keep usableState in sync with our counter.
+        if self.chargeCount[baseSpellID] and self.chargeCount[baseSpellID] > 0 then
+            self.usableState[baseSpellID] = true
+        end
+        return  -- charged spells fully handled; skip normal path
+    end
+
     -- Readiness: for most spells, IsSpellUsable alone is sufficient and lets
-    -- alerts fire mid-GCD.  For flagged spells (interrupt lockout), also
-    -- require cdActive=false to avoid false "ready" during lockout.
+    -- alerts fire mid-GCD.
+    -- Interrupt-like spells (usableLiesDuringCD): IsSpellUsable returns true
+    -- even during a real lockout CD.  When isUsable+cdActive, it could be
+    -- just GCD from another spell — preserve the current state.  OnSpellCast
+    -- already forces usableState=false for real casts.
     local isReady
     if self.usableLiesDuringCD[baseSpellID] then
-        isReady = isUsable and not cdActive
+        if not isUsable then
+            isReady = false
+        elseif not cdActive then
+            isReady = true
+        else
+            -- isUsable + cdActive: could be GCD or real lockout.
+            -- Preserve current state; OnSpellCast handles the lockout transition.
+            local prev = self.usableState[baseSpellID]
+            isReady = (prev == nil) and false or prev
+        end
     else
         isReady = isUsable
     end
@@ -1695,6 +2057,16 @@ function MA:InitCooldownStates()
     wipe(self.resourceReady)
     wipe(self.lastSpellAlert)
     wipe(self.usableLiesDuringCD)
+    wipe(self.chargeCount)
+    -- Cancel any running charge recovery timers.
+    for id, timer in pairs(self._chargeTimers) do
+        timer:Cancel()
+    end
+    wipe(self._chargeTimers)
+    -- Do NOT wipe _chargedSpells or _chargeRechargeDur: once detected (at login, out of combat),
+    -- the charged status is permanent for the session.  In-combat reinits
+    -- (e.g. /ma debug) would fail to re-detect because GetSpellCharges
+    -- returns secret proxy values that break comparisons.
 
     for spellID in pairs(self.charDb.trackedSpells) do
         local activeID = self:GetActiveSpellID(spellID)
@@ -1702,21 +2074,59 @@ function MA:InitCooldownStates()
             local rawUsable = C_Spell.IsSpellUsable(activeID)
             local cdInfo = C_Spell.GetSpellCooldown(activeID)
             local cdActive = cdInfo and cdInfo.isActive
+            -- Use cached charged-spell info first (reliable), fall back to API
+            -- only when not cached (works out of combat, fails in combat).
+            local maxCharges = self._chargedSpells[spellID]
+            if not maxCharges then
+                maxCharges = GetSpellMaxCharges(activeID)
+                if maxCharges <= 1 then maxCharges = GetSpellMaxCharges(spellID) end
+                if maxCharges > 1 then
+                    self._chargedSpells[spellID] = maxCharges
+                end
+            end
 
             -- Auto-detect interrupt-like spells at init: usable=true while
             -- cdActive=true (e.g. Disrupt during lockout).  Exclude charged
             -- spells where that combination is normal.
-            if rawUsable and cdActive then
-                local maxCharges = cdInfo and cdInfo.maxCharges or 0
-                if maxCharges <= 1 then
-                    self.usableLiesDuringCD[spellID] = true
-                end
+            if rawUsable and cdActive and (not maxCharges or maxCharges <= 1) then
+                self.usableLiesDuringCD[spellID] = true
             end
 
-            -- Readiness: ignore GCD for normal spells; require cdActive
-            -- check only for flagged spells.
+            -- Readiness: GCD is never accounted for.
             local isReady
-            if self.usableLiesDuringCD[spellID] then
+            if maxCharges and maxCharges > 1 then
+                -- Charged spell: seed the internal counter.
+                -- Out of combat: read real currentCharges.
+                -- In combat: infer from IsSpellUsable (true = at least 1 charge).
+                local cur
+                if not InCombatLockdown() then
+                    local chargeInfo = C_Spell.GetSpellCharges(activeID)
+                    if not chargeInfo then chargeInfo = C_Spell.GetSpellCharges(spellID) end
+                    cur = chargeInfo and chargeInfo.currentCharges or 0
+                    -- Cache per-charge recharge duration for in-combat timers.
+                    if chargeInfo and chargeInfo.cooldownDuration and chargeInfo.cooldownDuration > 0 then
+                        self._chargeRechargeDur[spellID] = chargeInfo.cooldownDuration
+                    end
+                else
+                    -- In combat: best we can do is assume max if usable+!cdActive,
+                    -- 1 if usable+cdActive, 0 if not usable.
+                    if rawUsable and not cdActive then
+                        cur = maxCharges
+                    elseif rawUsable then
+                        cur = 1  -- at least 1, recharging others
+                    else
+                        cur = 0
+                    end
+                end
+                self.chargeCount[spellID] = cur
+                isReady = (rawUsable == true) and cur > 0
+                -- If charges are recharging at init, arm a recovery timer.
+                if cdActive then
+                    self:ArmChargeWatch(spellID, true)
+                end
+            elseif self.usableLiesDuringCD[spellID] then
+                -- At init, no previous state exists; default to not-ready
+                -- when cdActive (could be real lockout or GCD — safe to assume CD).
                 isReady = (rawUsable == true) and not cdActive
             else
                 isReady = (rawUsable == true)
@@ -2224,7 +2634,57 @@ frame:SetScript("OnEvent", function(_, event, ...)
                 end
             end
         end)
-        print("|cff00ff00MochaAlerts|r v1.1.2 loaded. Type |cff88bbff/malerts|r to configure.")
+        print("|cff00ff00MochaAlerts|r v1.2.0 loaded. Type |cff88bbff/malerts|r to configure.")
+
+        -- Register in the in-game Addon settings list
+        if Settings and Settings.RegisterCanvasLayoutCategory then
+            local panel = CreateFrame("Frame")
+            panel.name = "MochaAlerts"
+
+            -- Header background
+            local hBg = panel:CreateTexture(nil, "BACKGROUND")
+            hBg:SetPoint("TOPLEFT", 0, 0)
+            hBg:SetPoint("TOPRIGHT", 0, 0)
+            hBg:SetHeight(54)
+            hBg:SetColorTexture(0.14, 0.14, 0.13, 1.0)
+            hBg:SetDrawLayer("BACKGROUND", 1)
+
+            -- Header separator
+            local hSep = panel:CreateTexture(nil, "BORDER")
+            hSep:SetPoint("TOPLEFT", 0, -54)
+            hSep:SetPoint("TOPRIGHT", 0, -54)
+            hSep:SetHeight(1)
+            hSep:SetColorTexture(0.42, 0.37, 0.30, 0.9)
+
+            -- Coffee icon
+            local hIcon = panel:CreateTexture(nil, "ARTWORK")
+            hIcon:SetSize(36, 36)
+            hIcon:SetPoint("TOPLEFT", 14, -9)
+            hIcon:SetTexture("Interface\\AddOns\\MochaAlerts\\Media\\Textures\\coffeeAlert.png")
+
+            -- Title
+            local hTitle = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+            hTitle:SetPoint("LEFT", hIcon, "RIGHT", 8, 0)
+            hTitle:SetText("|cffD4A96AMocha|r|cffEDD9A3Alerts|r")
+
+            -- "Open Settings" button
+            local openBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+            openBtn:SetSize(160, 28)
+            openBtn:SetPoint("TOPLEFT", 14, -70)
+            openBtn:SetText("Open MochaAlerts")
+            openBtn:SetScript("OnClick", function() MA:ToggleConfig() end)
+
+            -- Version text
+            local ver = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            ver:SetPoint("LEFT", openBtn, "RIGHT", 12, 0)
+            ver:SetTextColor(0.65, 0.52, 0.38)
+            local versionStr = (C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(addonName, "Version")) or "1.2.0"
+            ver:SetText("v" .. versionStr)
+
+            local category = Settings.RegisterCanvasLayoutCategory(panel, "MochaAlerts")
+            category.ID = "MochaAlerts"
+            Settings.RegisterAddOnCategory(category)
+        end
 
     elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_USABLE" then
         if MA.initialized and MA.db then
@@ -2479,6 +2939,7 @@ SlashCmdList["MochaAlerts"] = function(msg)
             local idx = tonumber(strtrim(rest))
             if idx and idx >= 0 and idx < #voices then
                 MA.db.ttsVoice = idx
+                MA._cachedSelectedVoice = nil  -- invalidate so GetSelectedVoice picks up the change
                 local v = voices[idx + 1]
                 print("|cff00ff00MochaAlerts:|r TTS voice set to: " .. (v.name or tostring(idx)))
             else
@@ -2530,7 +2991,10 @@ SlashCmdList["MochaAlerts"] = function(msg)
                 local onCD = MA:IsOnRealCooldown(spellID)
                 local usState = MA.usableState[spellID]
                 local liesFlag = MA.usableLiesDuringCD[spellID] and true or false
-                print("  " .. name .. " [" .. spellID .. "] known=" .. tostring(known) .. " usable=" .. tostring(usable) .. " onCD=" .. tostring(onCD) .. " state=" .. tostring(usState) .. " cdGate=" .. tostring(liesFlag))
+                local chargedMax = MA._chargedSpells[spellID]
+                local chargeCt = MA.chargeCount[spellID]
+                local chargeStr = chargedMax and (" charges=" .. tostring(chargeCt) .. "/" .. tostring(chargedMax)) or ""
+                print("  " .. name .. " [" .. spellID .. "] known=" .. tostring(known) .. " usable=" .. tostring(usable) .. " onCD=" .. tostring(onCD) .. " state=" .. tostring(usState) .. " cdGate=" .. tostring(liesFlag) .. chargeStr)
             end
         end
 
