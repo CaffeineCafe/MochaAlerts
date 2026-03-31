@@ -502,9 +502,80 @@ function MA:CreateConfigFrame()
         if not voices then return end
         -- Simple cycling through voices
         MA.db.ttsVoice = ((MA.db.ttsVoice or 0) + 1) % #voices
+        MA._cachedSelectedVoice = nil  -- invalidate cached voice object
         UpdateVoiceBtnText()
         -- Preview
         MA:TryTTS("Voice selected")
+    end)
+    y = y - 32
+
+    -- Alert Font selector (FontMagic fonts)
+    local fontLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    fontLabel:SetPoint("TOPLEFT", PAD, y)
+    fontLabel:SetText("Alert Font:")
+
+    local fontBtn = MakeButton(f, 320, 22, "")
+    fontBtn:SetPoint("LEFT", fontLabel, "RIGHT", 8, 0)
+    local function UpdateFontBtnText()
+        local currentPath = MA:GetAlertFontPath()
+        if currentPath == MA.DEFAULT_FONT then
+            fontBtn:SetText("Default (Friz Quadrata)")
+        else
+            -- find the matching name in FontLib
+            local found = false
+            for _, entry in ipairs(MA.FontLib) do
+                if entry.path == currentPath then
+                    fontBtn:SetText(entry.name)
+                    found = true
+                    break
+                end
+            end
+            if not found then fontBtn:SetText("Custom") end
+        end
+    end
+    UpdateFontBtnText()
+    fontBtn:SetScript("OnClick", function(btn) MA:ShowFontDropdown(btn) end)
+    MA._fontBtnUpdate = UpdateFontBtnText
+
+    -- Alert Color picker (inline next to font button)
+    local colorSwatch = CreateFrame("Button", nil, f)
+    colorSwatch:SetSize(22, 22)
+    colorSwatch:SetPoint("LEFT", fontBtn, "RIGHT", 8, 0)
+
+    local swatchBg = colorSwatch:CreateTexture(nil, "BACKGROUND")
+    swatchBg:SetAllPoints()
+    swatchBg:SetColorTexture(0, 0, 0, 1)
+
+    local swatchTex = colorSwatch:CreateTexture(nil, "OVERLAY")
+    swatchTex:SetPoint("TOPLEFT", 1, -1)
+    swatchTex:SetPoint("BOTTOMRIGHT", -1, 1)
+    local sr, sg, sb = MA:GetAlertColor()
+    swatchTex:SetColorTexture(sr, sg, sb, 1)
+
+    local swatchBorderT = colorSwatch:CreateTexture(nil,"BORDER"); swatchBorderT:SetColorTexture(0.36,0.33,0.28,1); swatchBorderT:SetHeight(1); swatchBorderT:SetPoint("TOPLEFT",-1,1); swatchBorderT:SetPoint("TOPRIGHT",1,1)
+    local swatchBorderB = colorSwatch:CreateTexture(nil,"BORDER"); swatchBorderB:SetColorTexture(0.36,0.33,0.28,1); swatchBorderB:SetHeight(1); swatchBorderB:SetPoint("BOTTOMLEFT",-1,-1); swatchBorderB:SetPoint("BOTTOMRIGHT",1,-1)
+    local swatchBorderL = colorSwatch:CreateTexture(nil,"BORDER"); swatchBorderL:SetColorTexture(0.36,0.33,0.28,1); swatchBorderL:SetWidth(1); swatchBorderL:SetPoint("TOPLEFT",-1,1); swatchBorderL:SetPoint("BOTTOMLEFT",-1,-1)
+    local swatchBorderR = colorSwatch:CreateTexture(nil,"BORDER"); swatchBorderR:SetColorTexture(0.36,0.33,0.28,1); swatchBorderR:SetWidth(1); swatchBorderR:SetPoint("TOPRIGHT",1,1); swatchBorderR:SetPoint("BOTTOMRIGHT",1,-1)
+
+    colorSwatch:SetScript("OnClick", function()
+        local cr, cg, cb = MA:GetAlertColor()
+        local function OnColorChanged()
+            local nr, ng, nb = ColorPickerFrame:GetColorRGB()
+            MA:SetAlertColor(nr, ng, nb)
+            swatchTex:SetColorTexture(nr, ng, nb, 1)
+        end
+        local function OnCancel(prev)
+            local pr, pg, pb = prev.r, prev.g, prev.b
+            MA:SetAlertColor(pr, pg, pb)
+            swatchTex:SetColorTexture(pr, pg, pb, 1)
+        end
+        local info = {
+            r = cr, g = cg, b = cb,
+            swatchFunc = OnColorChanged,
+            cancelFunc = OnCancel,
+            hasOpacity = false,
+        }
+        ColorPickerFrame:SetupColorPickerAndShow(info)
     end)
     y = y - 32
 
@@ -1285,6 +1356,143 @@ function MA:ShowSoundDropdown(anchor, id, isItem)
             else
                 btn.label:SetTextColor(0.88, 0.80, 0.68)
             end
+        end
+    end
+
+    dd:ClearAllPoints()
+    dd:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -2)
+    dd:Show()
+
+    dd:SetScript("OnUpdate", function()
+        if not dd:IsMouseOver() and not anchor:IsMouseOver() then
+            if IsMouseButtonDown("LeftButton") or IsMouseButtonDown("RightButton") then
+                dd:Hide()
+            end
+        end
+    end)
+end
+
+-------------------------------------------------------------------------------
+-- Font Dropdown (FontMagic fonts)
+-------------------------------------------------------------------------------
+function MA:ShowFontDropdown(anchor)
+    if not self.fontDropdown then
+        local ROW_H = 20
+        local PAD = 4
+        local WIDTH = 220
+        local MAX_VIS = 420
+        local CONTENT_W = WIDTH - 2 * PAD
+
+        local dd = CreateFrame("Frame", nil, UIParent)
+        dd:SetFrameStrata("TOOLTIP")
+        dd:SetClampedToScreen(true)
+        dd:EnableMouse(true)
+
+        local ddBg = dd:CreateTexture(nil, "BACKGROUND")
+        ddBg:SetAllPoints()
+        ddBg:SetColorTexture(0.10, 0.10, 0.10, 0.97)
+
+        local ddBT = dd:CreateTexture(nil,"BORDER"); ddBT:SetColorTexture(0.38,0.34,0.28,1); ddBT:SetHeight(1); ddBT:SetPoint("TOPLEFT"); ddBT:SetPoint("TOPRIGHT")
+        local ddBB = dd:CreateTexture(nil,"BORDER"); ddBB:SetColorTexture(0.38,0.34,0.28,1); ddBB:SetHeight(1); ddBB:SetPoint("BOTTOMLEFT"); ddBB:SetPoint("BOTTOMRIGHT")
+        local ddBL = dd:CreateTexture(nil,"BORDER"); ddBL:SetColorTexture(0.38,0.34,0.28,1); ddBL:SetWidth(1); ddBL:SetPoint("TOPLEFT"); ddBL:SetPoint("BOTTOMLEFT")
+        local ddBR = dd:CreateTexture(nil,"BORDER"); ddBR:SetColorTexture(0.38,0.34,0.28,1); ddBR:SetWidth(1); ddBR:SetPoint("TOPRIGHT"); ddBR:SetPoint("BOTTOMRIGHT")
+
+        local scroll = CreateFrame("ScrollFrame", nil, dd)
+        scroll:SetPoint("TOPLEFT", PAD, -PAD)
+        scroll:SetPoint("BOTTOMRIGHT", -PAD, PAD)
+        scroll:EnableMouseWheel(true)
+        scroll:SetScript("OnMouseWheel", function(self, delta)
+            local cur = self:GetVerticalScroll()
+            local mx = self:GetVerticalScrollRange()
+            self:SetVerticalScroll(math.max(0, math.min(cur - delta * 60, mx)))
+        end)
+
+        local content = CreateFrame("Frame", nil, scroll)
+        content:SetWidth(CONTENT_W)
+        scroll:SetScrollChild(content)
+
+        dd:Hide()
+        dd.buttons = {}
+        dd.catLabels = {}
+
+        -- "Default" entry
+        local defBtn = CreateFrame("Button", nil, content)
+        defBtn:SetSize(CONTENT_W, ROW_H)
+        defBtn:SetPoint("TOPLEFT", 0, 0)
+        local defHl = defBtn:CreateTexture(nil, "HIGHLIGHT")
+        defHl:SetAllPoints()
+        defHl:SetColorTexture(0.55, 0.50, 0.40, 0.25)
+        local defLabel = defBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        defLabel:SetPoint("LEFT", 4, 0)
+        defLabel:SetText("Default (Friz Quadrata)")
+        defBtn.label = defLabel
+        defBtn.fontPath = MA.DEFAULT_FONT
+        dd.buttons[1] = defBtn
+
+        local yOfs = ROW_H + 2  -- after default + small gap
+
+        -- Build categorized font entries
+        local lastCat = nil
+        for idx, entry in ipairs(MA.FontLib) do
+            -- Category header
+            if entry.category ~= lastCat then
+                lastCat = entry.category
+                local catSep = content:CreateTexture(nil, "ARTWORK")
+                catSep:SetHeight(1)
+                catSep:SetPoint("TOPLEFT", 0, -yOfs)
+                catSep:SetPoint("TOPRIGHT", 0, -yOfs)
+                catSep:SetColorTexture(0.36, 0.33, 0.28, 0.6)
+                yOfs = yOfs + 3
+
+                local catLabel = content:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+                catLabel:SetPoint("TOPLEFT", 4, -yOfs)
+                catLabel:SetText("|cff8B6F50" .. entry.category .. "|r")
+                yOfs = yOfs + 14
+            end
+
+            local btn = CreateFrame("Button", nil, content)
+            btn:SetSize(CONTENT_W, ROW_H)
+            btn:SetPoint("TOPLEFT", 0, -yOfs)
+
+            local bhl = btn:CreateTexture(nil, "HIGHLIGHT")
+            bhl:SetAllPoints()
+            bhl:SetColorTexture(0.55, 0.50, 0.40, 0.25)
+
+            local label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            label:SetPoint("LEFT", 4, 0)
+            label:SetPoint("RIGHT", -4, 0)
+            label:SetJustifyH("LEFT")
+            label:SetText(entry.name)
+            btn.label = label
+            btn.fontPath = entry.path
+
+            dd.buttons[#dd.buttons + 1] = btn
+            yOfs = yOfs + ROW_H
+        end
+
+        content:SetHeight(yOfs)
+        dd:SetSize(WIDTH, math.min(yOfs + 2 * PAD, MAX_VIS))
+
+        self.fontDropdown = dd
+    end
+
+    local dd = self.fontDropdown
+    local currentPath = self:GetAlertFontPath()
+
+    -- Reset scroll
+    local scroll = dd:GetChildren()
+    if scroll and scroll.SetVerticalScroll then scroll:SetVerticalScroll(0) end
+
+    for _, btn in ipairs(dd.buttons) do
+        btn:SetScript("OnClick", function()
+            MA:SetAlertFont(btn.fontPath)
+            dd:Hide()
+            if MA._fontBtnUpdate then MA._fontBtnUpdate() end
+        end)
+        if btn.fontPath == currentPath then
+            btn.label:SetTextColor(0.92, 0.68, 0.22)
+        else
+            btn.label:SetTextColor(0.88, 0.80, 0.68)
         end
     end
 

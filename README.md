@@ -3,7 +3,7 @@
 A World of Warcraft addon that plays voice and sound alerts when your tracked spells and items come off cooldown and are ready to cast.
 
 **Author:** CaffeineCafe  
-**Version:** 1.1.2  
+**Version:** 1.2.0  
 **Interface:** 120000 (The War Within / Midnight)
 
 ---
@@ -17,7 +17,8 @@ A World of Warcraft addon that plays voice and sound alerts when your tracked sp
 - **Health Potion grouping** — all health pot variants share one alert entry so you're never spammed
 - **Fleeting potion grouping** — cauldron variants and their base potions are merged into one entry automatically
 - **Spell override support** — correctly handles talent overrides and form transforms (e.g. Void Meta / Annihilation)
-- **GCD-aware alerting** — alerts fire the instant a spell's real cooldown expires, even mid-GCD; interrupt-like spells (e.g. Disrupt) are auto-detected and gated on the lockout CD
+- **GCD-immune alerting** — alerts are never delayed by the global cooldown; interrupt-like spells (e.g. Disrupt) are auto-detected and gated on the real lockout CD
+- **Configurable alert color** — change the on-screen alert text color via the built-in color picker
 - **Lockout suppression** — suppresses false alerts triggered by movement abilities like Roll and Lighter Than Air
 - **Configurable poll interval** — adjust how frequently the addon checks for cooldown changes (0.01s–0.40s) for snappier or lighter alerts
 - **Minimap button** — left-click to open settings; drag to reposition around the minimap
