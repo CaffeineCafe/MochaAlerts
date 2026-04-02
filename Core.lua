@@ -15,8 +15,8 @@ local tinsert = tinsert
 local tconcat = table.concat
 
 -- Constants
-local ALERT_THROTTLE = 0.3
-local TTS_COALESCE_WINDOW = 0.05  -- brief window to catch truly simultaneous alerts before speaking
+local ALERT_THROTTLE = 0.15
+local TTS_COALESCE_WINDOW = 0.035 -- brief window to catch truly simultaneous alerts before speaking
 local DEFAULT_POLL_INTERVAL = 0.25 -- fallback before DB loads; overridden by db.pollInterval
 
 -- Defaults
@@ -28,7 +28,7 @@ local defaults = {
     alertPos = nil,  -- { point, relPoint, x, y }
     ttsVoice = 0,   -- 0-based index into C_VoiceChat.GetTtsVoices() (0 = first voice)
     pollInterval = 0.25, -- safety-net poll interval in seconds (0.01–0.40)
-    alertFont = nil, -- nil = default Friz Quadrata; otherwise a FontMagic font path
+    alertFont = nil, -- nil = default Friz Quadrata; otherwise a bundled font path
     alertColor = {r = 0, g = 1, b = 0}, -- visual alert text color (default green)
 }
 
@@ -55,6 +55,7 @@ MA._chargeTimers = {}     -- [baseSpellID] = C_Timer handle for per-charge recov
 MA._chargeRechargeDur = {} -- [baseSpellID] = per-charge recharge duration in seconds (cached at init, out of combat)
 MA._chargedSpells = {}    -- [baseSpellID] = maxCharges, cached at init (out of combat) so we never need secret-value APIs at runtime
 MA.lastSpellCheckTime = 0 -- GetTime() of last event-driven spell check (throttle)
+MA.lastUsableCheckTime = 0 -- GetTime() of last SPELL_UPDATE_USABLE check (separate from CD events)
 MA.lastItemCheckTime = 0  -- GetTime() of last event-driven item check (throttle)
 MA._displayTextOpen = {}  -- [rowKey] = true when the display-text edit box is open in the config UI
 MA.initialized = false
@@ -211,14 +212,14 @@ MA.itemSpellMap = {}        -- [itemID] = spellID resolved from GetItemSpell
 MA.itemSpellReverse = {}    -- [spellID] = itemID reverse lookup for cast detection
 
 -------------------------------------------------------------------------------
--- Font Library (sourced from FontMagic addon)
+-- Font Library (bundled fonts, originally from FontMagic)
 -------------------------------------------------------------------------------
 MA.FontLib = {}  -- { { name = "Display Name", path = "Interface\\...\\file.ttf", category = "Popular" }, ... }
 MA.DEFAULT_FONT = "Fonts\\FRIZQT__.TTF"
 
 do
-    local FM_PATH = "Interface\\AddOns\\FontMagic\\"
-    -- Mirror FontMagic's category→folder mapping
+    local FM_PATH = "Interface\\AddOns\\MochaAlerts\\Fonts\\"
+    -- Category→folder mapping
     local FM_GROUPS = {
         { category = "Popular",          folder = "Popular" },
         { category = "Clean & Readable", folder = "Easy-to-Read" },
@@ -227,7 +228,7 @@ do
         { category = "Sci-Fi & Tech",    folder = "Future" },
         { category = "Random",           folder = "Random" },
     }
-    -- Font files per folder (must match FontMagic's shipped files)
+    -- Font files per folder
     local FM_FONTS = {
         ["Popular"] = {
             "Pepsi.ttf", "bignoodletitling.ttf", "Expressway.ttf", "Bangers.ttf", "PTSansNarrow-Bold.ttf", "Roboto Condensed Bold.ttf",
@@ -673,10 +674,10 @@ local ALERT_SCALE_STEP = 0.10   -- each higher slot is this much smaller
 function MA:CreateAlertFrame()
     if self.alertPool[1] then return end
 
-    local GROW_DUR    = 0.25
-    local HOLD_DUR    = 1.5
-    local FADE_DUR    = 0.8
-    local START_SCALE = 0.5
+    local GROW_DUR    = 0.15
+    local HOLD_DUR    = 1.0
+    local FADE_DUR    = 0.5
+    local START_SCALE = 0.6
 
     for i = 1, ALERT_POOL_SIZE do
         local f = CreateFrame("Frame", i == 1 and "MochaAlertsAlertFrame" or nil, UIParent)
@@ -1688,11 +1689,12 @@ function MA:CheckUsability(baseSpellID, activeID)
                 self.chargeCount[baseSpellID] = cur
                 self.usableState[baseSpellID] = isUsable and cur > 0
             end
-        end
-        -- In combat: C_Timer handles recovery detection (see ArmChargeWatch).
-        -- Just keep usableState in sync with our counter.
-        if self.chargeCount[baseSpellID] and self.chargeCount[baseSpellID] > 0 then
-            self.usableState[baseSpellID] = true
+        else
+            -- In combat: C_Timer handles recovery detection (see ArmChargeWatch).
+            -- Just keep usableState in sync with our counter.
+            if self.chargeCount[baseSpellID] and self.chargeCount[baseSpellID] > 0 then
+                self.usableState[baseSpellID] = true
+            end
         end
         return  -- charged spells fully handled; skip normal path
     end
@@ -1948,7 +1950,7 @@ function MA:ProcessItemPendingCDs()
     for itemID, doneTime in pairs(self.itemCdPending) do
         local now = GetTime()
         local lastAlert = self.itemLastAlert[itemID] or 0
-        if (now - lastAlert) >= 2.0 then
+        if (now - lastAlert) >= 0.5 then
             self.itemLastAlert[itemID] = now
             if self.charDb.trackedItems[itemID] then
                 -- Gate: only fire if a real use was seen (catches rez/zone
@@ -2040,6 +2042,7 @@ function MA:InitItemStates()
     wipe(self.itemUsableState)
     wipe(self.itemLastAlert)
     wipe(self.itemCastSeen)
+    wipe(self.itemCdPending)  -- prevent stale CD-frame callbacks from causing false alerts after zone changes
     for itemID in pairs(self.charDb.trackedItems) do
         local onCD = self:IsItemOnRealCooldown(itemID)
         if onCD ~= nil then
@@ -2201,8 +2204,59 @@ function MA:InitSingleSpell(spellID)
     if not IsPlayerSpell(spellID) then return end
     local activeID = self:GetActiveSpellID(spellID)
     self._activeSpellCache[spellID] = activeID
+
+    -- Register override mapping so OnSpellCast recognises casts of the override.
+    self._overrideToBase = self._overrideToBase or {}
+    self._overrideToBase[activeID] = spellID
+    self._overrideToBase[spellID] = spellID
+    self._lastActiveID = self._lastActiveID or {}
+    self._lastActiveID[spellID] = activeID
+
     local rawUsable = C_Spell.IsSpellUsable(activeID)
-    self.usableState[spellID] = (rawUsable == true) and true or false
+    local cdInfo = C_Spell.GetSpellCooldown(activeID)
+    local cdActive = cdInfo and cdInfo.isActive
+
+    -- Detect charged spells (only reliable out of combat).
+    local maxCharges = GetSpellMaxCharges(activeID)
+    if maxCharges <= 1 then maxCharges = GetSpellMaxCharges(spellID) end
+    if maxCharges > 1 then
+        self._chargedSpells[spellID] = maxCharges
+        local chargeInfo = C_Spell.GetSpellCharges(activeID)
+        if not chargeInfo then chargeInfo = C_Spell.GetSpellCharges(spellID) end
+        if chargeInfo then
+            self.chargeCount[spellID] = chargeInfo.currentCharges or 0
+            if chargeInfo.cooldownDuration and chargeInfo.cooldownDuration > 0 then
+                self._chargeRechargeDur[spellID] = chargeInfo.cooldownDuration
+            end
+        end
+    end
+
+    -- Auto-detect interrupt-like spells (usable=true during real CD).
+    if rawUsable and cdActive and (not maxCharges or maxCharges <= 1) then
+        self.usableLiesDuringCD[spellID] = true
+    end
+
+    -- Determine readiness (mirrors InitCooldownStates logic).
+    local isReady
+    if maxCharges and maxCharges > 1 then
+        isReady = (rawUsable == true) and (self.chargeCount[spellID] or 0) > 0
+    elseif self.usableLiesDuringCD[spellID] then
+        isReady = (rawUsable == true) and not cdActive
+    else
+        isReady = (rawUsable == true)
+    end
+    self.usableState[spellID] = isReady
+
+    -- If not ready, arm for first-expiry alert (mirrors InitCooldownStates).
+    if not isReady then
+        self.usableFalseAt[spellID] = GetTime()
+        self.spellCastSeen[spellID] = true
+    end
+
+    -- If charged and recharging at add-time, arm the charge recovery timer.
+    if maxCharges and maxCharges > 1 and cdActive then
+        self:ArmChargeWatch(spellID, true)
+    end
 end
 
 function MA:RemoveSpell(spellID)
@@ -2214,6 +2268,13 @@ function MA:RemoveSpell(spellID)
     self.spellCastSeen[spellID] = nil
     self.resourceReady[spellID] = nil
     self.lastSpellAlert[spellID] = nil
+    self.usableLiesDuringCD[spellID] = nil
+    self.chargeCount[spellID] = nil
+    -- Cancel any running charge recovery timer so it doesn't fire for a removed spell.
+    if self._chargeTimers[spellID] then
+        self._chargeTimers[spellID]:Cancel()
+        self._chargeTimers[spellID] = nil
+    end
     print("|cff00ff00MochaAlerts:|r Removed " .. spellName)
     if self.configFrame and self.configFrame:IsShown() then
         self:RefreshSpellList()
@@ -2541,6 +2602,7 @@ frame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 frame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 frame:RegisterEvent("SPELLS_CHANGED")
 frame:RegisterEvent("BAG_UPDATE_COOLDOWN")
+frame:RegisterEvent("ACTIONBAR_UPDATE_COOLDOWN")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 
 frame:SetScript("OnEvent", function(_, event, ...)
@@ -2686,19 +2748,25 @@ frame:SetScript("OnEvent", function(_, event, ...)
             Settings.RegisterAddOnCategory(category)
         end
 
-    elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_USABLE" then
+    elseif event == "SPELL_UPDATE_COOLDOWN" or event == "ACTIONBAR_UPDATE_COOLDOWN" then
+        if MA.initialized and MA.db then
+            local now = GetTime()
+            if (now - MA.lastSpellCheckTime) >= 0.05 then
+                MA.lastSpellCheckTime = now
+                pcall(MA.CheckCooldowns, MA)
+            end
+        end
+
+    elseif event == "SPELL_UPDATE_USABLE" then
         if MA.initialized and MA.db then
             -- Rebuild override map on usability changes so form-entry re-snapshots
             -- happen before CheckCooldowns compares states.
-            local overrideChanged = false
-            if event == "SPELL_UPDATE_USABLE" then
-                overrideChanged = MA:BuildOverrideMap()
-            end
-            -- Throttle the full spell check to avoid redundant loops on rapid events.
-            -- Always bypass the throttle when an override changed (e.g. Void Meta exit)
-            -- so CheckCooldowns runs immediately even if UNIT_AURA was throttled.
+            local overrideChanged = MA:BuildOverrideMap()
+            -- Use a separate throttle timestamp so a recent SPELL_UPDATE_COOLDOWN
+            -- doesn't prevent this usability-driven check from running.
             local now = GetTime()
-            if overrideChanged or (now - MA.lastSpellCheckTime) >= 0.05 then
+            if overrideChanged or (now - MA.lastUsableCheckTime) >= 0.05 then
+                MA.lastUsableCheckTime = now
                 MA.lastSpellCheckTime = now
                 pcall(MA.CheckCooldowns, MA)
             end
