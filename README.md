@@ -3,7 +3,7 @@
 A World of Warcraft addon that plays voice and sound alerts when your tracked spells and items come off cooldown and are ready to cast.
 
 **Author:** CaffeineCafe  
-**Version:** 1.2.0  
+**Version:** 1.2.2  
 **Interface:** 120000 (The War Within / Midnight)
 
 ---

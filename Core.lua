@@ -15,8 +15,8 @@ local tinsert = tinsert
 local tconcat = table.concat
 
 -- Constants
-local ALERT_THROTTLE = 0.15
-local TTS_COALESCE_WINDOW = 0.035 -- brief window to catch truly simultaneous alerts before speaking
+local ALERT_THROTTLE = 0.05
+local TTS_COALESCE_WINDOW = 0.020 -- brief window to catch truly simultaneous alerts before speaking
 local DEFAULT_POLL_INTERVAL = 0.25 -- fallback before DB loads; overridden by db.pollInterval
 
 -- Defaults
@@ -58,6 +58,9 @@ MA.lastSpellCheckTime = 0 -- GetTime() of last event-driven spell check (throttl
 MA.lastUsableCheckTime = 0 -- GetTime() of last SPELL_UPDATE_USABLE check (separate from CD events)
 MA.lastItemCheckTime = 0  -- GetTime() of last event-driven item check (throttle)
 MA._displayTextOpen = {}  -- [rowKey] = true when the display-text edit box is open in the config UI
+MA.lastShapeshiftForm = 0 -- last known GetShapeshiftFormID(); used to detect druid form changes
+MA.formChangeTime = 0     -- GetTime() of last detected form change; grace window suppresses re-init
+MA._formGatedCD = {}      -- [baseSpellID] = true for spells on real CD when a form shift occurred
 MA.initialized = false
 MA.elapsed = 0
 MA.debugMode = false
@@ -1343,6 +1346,13 @@ function MA:BuildOverrideMap()
             self._activeSpellCache[baseID] = activeID
         end
     end
+    -- Ensure form-gated spells stay in the active cache for CD expiry
+    -- detection even if IsPlayerSpell returns false in the current form.
+    for baseID in pairs(self._formGatedCD) do
+        if not self._activeSpellCache[baseID] then
+            self._activeSpellCache[baseID] = self:GetActiveSpellID(baseID)
+        end
+    end
     return anyOverrideChanged
 end
 
@@ -1749,7 +1759,7 @@ function MA:CheckUsability(baseSpellID, activeID)
         -- Post-cast bounce guard: right after a cast, APIs can briefly
         -- report usable=true / cdActive=false before the CD is fully applied.
         local falseAt = self.usableFalseAt[baseSpellID]
-        if falseAt and (now - falseAt) < 0.1 then
+        if falseAt and (now - falseAt) < 0.025 then
             if self.debugMode then
                 local name = C_Spell.GetSpellName(baseSpellID) or tostring(baseSpellID)
                 print("|cffff8800MochaAlerts DBG:|r Suppressed bounce for " .. name
@@ -1789,6 +1799,35 @@ function MA:CheckUsability(baseSpellID, activeID)
                 self:Speak(spellName .. " ready", baseSpellID)
             end
         end
+    end
+
+    -- Form-gated CD expiry: if the spell became unusable due to a form
+    -- change but the real cooldown has since expired, alert the player so
+    -- they know the ability is ready once they shift back.
+    if not isReady and self._formGatedCD[baseSpellID] then
+        if not cdActive then
+            -- CD expired while in wrong form.
+            self._formGatedCD[baseSpellID] = nil
+            if self.spellCastSeen[baseSpellID] then
+                self.spellCastSeen[baseSpellID] = nil
+                local now = GetTime()
+                local lastAlert = self.lastSpellAlert[baseSpellID] or 0
+                if (now - lastAlert) >= ALERT_THROTTLE then
+                    self.lastSpellAlert[baseSpellID] = now
+                    local spellName = C_Spell.GetSpellName(activeID) or C_Spell.GetSpellName(baseSpellID)
+                    if spellName then
+                        if self.debugMode then
+                            print("|cffaa88ffMochaAlerts DBG:|r Form-gated CD expired: " .. spellName)
+                        end
+                        self:Speak(spellName .. " ready", baseSpellID)
+                    end
+                end
+            end
+        end
+    elseif isReady and self._formGatedCD[baseSpellID] then
+        -- Player shifted back and spell is usable; normal path handled the
+        -- alert (if applicable).  Clear form-gated flag.
+        self._formGatedCD[baseSpellID] = nil
     end
 
     -- Record when this spell transitions to not-ready so the bounce guard
@@ -2061,6 +2100,7 @@ function MA:InitCooldownStates()
     wipe(self.lastSpellAlert)
     wipe(self.usableLiesDuringCD)
     wipe(self.chargeCount)
+    wipe(self._formGatedCD)
     -- Cancel any running charge recovery timers.
     for id, timer in pairs(self._chargeTimers) do
         timer:Cancel()
@@ -2139,10 +2179,14 @@ function MA:InitCooldownStates()
             -- resetting a cooldown) is caught by the bounce guard.
             if not isReady then
                 self.usableFalseAt[spellID] = GetTime()
-                -- Spell was not ready at init: pre-arm so its first expiry alerts.
-                -- (spellCastSeen stays nil for spells that start ready, which
-                --  blocks false "ready" alerts caused by rez/port state resets.)
-                self.spellCastSeen[spellID] = true
+                -- Only arm spellCastSeen when the spell is genuinely on a
+                -- real cooldown.  Spells that are merely form-gated (druid in
+                -- wrong form) or resource-gated show !isReady with cdActive
+                -- false; arming them would cause mass false alerts when the
+                -- player shifts back or gains resources.
+                if cdActive then
+                    self.spellCastSeen[spellID] = true
+                end
             end
             -- Init resource state: nil = unknown, first check won't alert
             local resMin = self:GetSpellResourceMin(spellID)
@@ -2248,9 +2292,13 @@ function MA:InitSingleSpell(spellID)
     self.usableState[spellID] = isReady
 
     -- If not ready, arm for first-expiry alert (mirrors InitCooldownStates).
+    -- Only arm when on a real CD; form-gated / resource-gated spells must
+    -- not be armed or they fire false alerts on form shift / resource gain.
     if not isReady then
         self.usableFalseAt[spellID] = GetTime()
-        self.spellCastSeen[spellID] = true
+        if cdActive then
+            self.spellCastSeen[spellID] = true
+        end
     end
 
     -- If charged and recharging at add-time, arm the charge recovery timer.
@@ -2669,6 +2717,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
         end
 
     elseif event == "PLAYER_LOGIN" then
+        MA.lastShapeshiftForm = GetShapeshiftFormID() or 0
         MA:BuildOverrideMap()
         MA:BuildLockoutSet()
         MA:ResolveItemSpells()
@@ -2696,7 +2745,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
                 end
             end
         end)
-        print("|cff00ff00MochaAlerts|r v1.2.0 loaded. Type |cff88bbff/malerts|r to configure.")
+        print("|cff00ff00MochaAlerts|r v1.2.2 loaded. Type |cff88bbff/malerts|r to configure.")
 
         -- Register in the in-game Addon settings list
         if Settings and Settings.RegisterCanvasLayoutCategory then
@@ -2740,7 +2789,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             local ver = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
             ver:SetPoint("LEFT", openBtn, "RIGHT", 12, 0)
             ver:SetTextColor(0.65, 0.52, 0.38)
-            local versionStr = (C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(addonName, "Version")) or "1.2.0"
+            local versionStr = (C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(addonName, "Version")) or "1.2.2"
             ver:SetText("v" .. versionStr)
 
             local category = Settings.RegisterCanvasLayoutCategory(panel, "MochaAlerts")
@@ -2751,7 +2800,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
     elseif event == "SPELL_UPDATE_COOLDOWN" or event == "ACTIONBAR_UPDATE_COOLDOWN" then
         if MA.initialized and MA.db then
             local now = GetTime()
-            if (now - MA.lastSpellCheckTime) >= 0.05 then
+            if now > MA.lastSpellCheckTime then
                 MA.lastSpellCheckTime = now
                 pcall(MA.CheckCooldowns, MA)
             end
@@ -2765,7 +2814,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             -- Use a separate throttle timestamp so a recent SPELL_UPDATE_COOLDOWN
             -- doesn't prevent this usability-driven check from running.
             local now = GetTime()
-            if overrideChanged or (now - MA.lastUsableCheckTime) >= 0.05 then
+            if overrideChanged or now > MA.lastUsableCheckTime then
                 MA.lastUsableCheckTime = now
                 MA.lastSpellCheckTime = now
                 pcall(MA.CheckCooldowns, MA)
@@ -2776,7 +2825,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
         if MA.initialized and MA.db then
             pcall(MA.ReSyncItemCDFrames, MA)
             local now = GetTime()
-            if (now - MA.lastItemCheckTime) >= 0.05 then
+            if now > MA.lastItemCheckTime then
                 MA.lastItemCheckTime = now
                 pcall(MA.CheckItemCooldowns, MA)
             end
@@ -2834,7 +2883,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             local now = GetTime()
             -- Always check immediately on an override change (e.g. Void Meta entry)
             -- so spells that just became ready don't wait for the throttle window.
-            if overrideChanged or (now - MA.lastSpellCheckTime) >= 0.05 then
+            if overrideChanged or now > MA.lastSpellCheckTime then
                 MA.lastSpellCheckTime = now
                 pcall(MA.CheckCooldowns, MA)
             end
@@ -2844,7 +2893,11 @@ frame:SetScript("OnEvent", function(_, event, ...)
         -- Only relevant out of combat: CheckResource already no-ops in combat.
         local unit = ...
         if unit == "player" and MA.initialized and MA.db and not InCombatLockdown() then
-            pcall(MA.CheckCooldowns, MA)
+            local now = GetTime()
+            if now > MA.lastSpellCheckTime then
+                MA.lastSpellCheckTime = now
+                pcall(MA.CheckCooldowns, MA)
+            end
         end
 
 
@@ -2852,7 +2905,47 @@ frame:SetScript("OnEvent", function(_, event, ...)
         if MA.initialized and MA.db then
             MA:BuildOverrideMap()
             MA:BuildLockoutSet()
-            if not InCombatLockdown() then
+
+            -- Detect shapeshift form changes (druid forms, etc.).
+            -- SPELLS_CHANGED fires when shifting forms; a full
+            -- InitCooldownStates would re-arm spellCastSeen for all
+            -- not-ready spells, causing mass false alerts when the
+            -- API settles or when the player shifts back.
+            -- Form detection is safe in and out of combat
+            -- (GetShapeshiftFormID and cdInfo.isActive are non-secret).
+            local isFormChange = false
+            if event == "SPELLS_CHANGED" then
+                local currentForm = GetShapeshiftFormID() or 0
+                local now = GetTime()
+                if currentForm ~= MA.lastShapeshiftForm then
+                    MA.lastShapeshiftForm = currentForm
+                    MA.formChangeTime = now
+                    isFormChange = true
+                elseif (now - MA.formChangeTime) < 1.0 then
+                    -- Still within form-change grace window;
+                    -- follow-up SPELLS_CHANGED events from the
+                    -- same shift should not re-init either.
+                    isFormChange = true
+                end
+            end
+
+            if isFormChange then
+                -- Mark spells that were on real CD when the form shifted
+                -- so CheckUsability can alert when their CD expires even
+                -- though IsSpellUsable returns false (wrong form).
+                for baseSpellID, activeID in pairs(MA._activeSpellCache) do
+                    if MA.spellCastSeen[baseSpellID] then
+                        local cdInfo = C_Spell.GetSpellCooldown(activeID)
+                        if cdInfo and cdInfo.isActive then
+                            MA._formGatedCD[baseSpellID] = true
+                        end
+                    end
+                end
+                if MA.debugMode then
+                    print("|cffff8800MochaAlerts DBG:|r SPELLS_CHANGED from form change — skipping re-init")
+                end
+            elseif not InCombatLockdown() then
+                MA.lastShapeshiftForm = GetShapeshiftFormID() or 0
                 MA:ResolveItemSpells()
                 MA:InitCooldownStates()
                 MA:InitItemStates()
@@ -2866,6 +2959,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
     -- spellCastSeen → transition fires when API settles).
     elseif event == "PLAYER_ENTERING_WORLD" then
         if MA.initialized and MA.db then
+            MA.lastShapeshiftForm = GetShapeshiftFormID() or 0
             MA:InitCooldownStates()
             MA:InitItemStates()
             if MA.debugMode then
