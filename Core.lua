@@ -30,6 +30,7 @@ local defaults = {
     pollInterval = 0.25, -- safety-net poll interval in seconds (0.01–0.40)
     alertFont = nil, -- nil = default Friz Quadrata; otherwise a bundled font path
     alertColor = {r = 0, g = 1, b = 0}, -- visual alert text color (default green)
+    minimap = {},  -- LibDBIcon position table
 }
 
 -- Per-character defaults
@@ -66,100 +67,16 @@ MA.elapsed = 0
 MA.debugMode = false
 
 -------------------------------------------------------------------------------
--- Minimap Button (no library required)
+-- Minimap Button (LibDBIcon)
 -------------------------------------------------------------------------------
 
---[[
-    CreateMinimapButton
-    Creates a Blizzard-style minimap button for MochaAlerts, using a custom icon and proper layering.
-    - Uses Blizzard's border, background, and highlight textures.
-    - Icon is round-cropped and centered.
-    - Button is draggable and remembers its position as an angle around the minimap.
-    - Left-click toggles the config UI.
-]]
-local function CreateMinimapButton()
-    if MA.MinimapButton then return end
-
-    local BUTTON_SIZE = 32
-    local ICON_SIZE = 18
-    local BORDER_SIZE = 50
-    local BG_SIZE = 24
-    local HIGHLIGHT_SIZE = 32
-    local MINIMAP_RADIUS = 100
-
-    local function UpdateMinimapPos(btn)
-        local angle = (MochaAlertsCharDB and MochaAlertsCharDB.minimapAngle) or 215
-        local rad = math.rad(angle)
-        btn:ClearAllPoints()
-        btn:SetPoint("CENTER", Minimap, "CENTER", math.cos(rad) * MINIMAP_RADIUS, math.sin(rad) * MINIMAP_RADIUS)
-    end
-
-    local button = CreateFrame("Button", "MochaAlertsMinimapButton", Minimap)
-    button:SetSize(BUTTON_SIZE, BUTTON_SIZE)
-    button:SetFrameStrata("MEDIUM")
-    button:EnableMouse(true)
-    button:RegisterForDrag("LeftButton")
-
-    -- Background (Blizzard style)
-    local background = button:CreateTexture(nil, "BACKGROUND")
-    background:SetTexture(136467) -- "Interface\\Minimap\\UI-Minimap-Background"
-    background:SetSize(BG_SIZE, BG_SIZE)
-    background:SetPoint("CENTER", button, "CENTER", 0, 0)
-    button.background = background
-
-    -- Icon (custom, round crop)
-    local icon = button:CreateTexture(nil, "ARTWORK")
-    icon:SetTexture("Interface\\AddOns\\MochaAlerts\\Media\\Textures\\coffeeAlert.tga")
-    icon:SetSize(ICON_SIZE, ICON_SIZE)
-    icon:SetPoint("CENTER", button, "CENTER", 0, 0)
-    icon:SetTexCoord(0.1, 0.9, 0.1, 0.9)
-    button.icon = icon
-
-    -- Border (Blizzard style)
-    local border = button:CreateTexture(nil, "OVERLAY")
-    border:SetTexture(136430) -- "Interface\\Minimap\\MiniMap-TrackingBorder"
-    border:SetSize(BORDER_SIZE, BORDER_SIZE)
-    border:SetPoint("TOPLEFT", button, "TOPLEFT", 0, 0)
-    button.border = border
-
-    -- Highlight (Blizzard style)
-    local highlight = button:CreateTexture(nil, "HIGHLIGHT")
-    highlight:SetTexture(136477) -- "Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight"
-    highlight:SetSize(HIGHLIGHT_SIZE, HIGHLIGHT_SIZE)
-    highlight:SetPoint("CENTER", button, "CENTER", 0, 0)
-    button:SetHighlightTexture(highlight)
-
-    -- Drag to move around minimap (angle-locked, no free movement)
-    button:SetScript("OnDragStart", function(self)
-        self:SetScript("OnUpdate", function(self)
-            local scale = UIParent:GetEffectiveScale()
-            local cx, cy = GetCursorPosition()
-            local mx, my = Minimap:GetCenter()
-            cx, cy = cx / scale, cy / scale
-            local angle = math.deg(math.atan2(cy - my, cx - mx)) % 360
-            MochaAlertsCharDB = MochaAlertsCharDB or {}
-            MochaAlertsCharDB.minimapAngle = angle
-            UpdateMinimapPos(self)
-        end)
-    end)
-    button:SetScript("OnDragStop", function(self)
-        self:SetScript("OnUpdate", nil)
-        UpdateMinimapPos(self)
-    end)
-
-    -- Tooltip
-    button:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        GameTooltip:SetText("MochaAlerts", 1, 1, 1)
-        GameTooltip:AddLine("Left-click to open settings.", 0.8, 0.8, 0.8)
-        GameTooltip:Show()
-    end)
-    button:SetScript("OnLeave", function()
-        GameTooltip:Hide()
-    end)
-
-    -- Left-click to open config UI
-    button:SetScript("OnClick", function(self, btn)
+local MochaAlertsLDB = LibStub("LibDataBroker-1.1"):NewDataObject("MochaAlerts", {
+    type = "launcher",
+    text = "MochaAlerts",
+    label = "MochaAlerts",
+    icon = "Interface\\AddOns\\MochaAlerts\\Media\\Textures\\coffeeAlert.tga",
+    iconCoords = {0.1, 0.9, 0.1, 0.9},
+    OnClick = function(_, btn)
         if btn == "LeftButton" then
             if MA.ToggleConfig then
                 MA:ToggleConfig()
@@ -167,18 +84,13 @@ local function CreateMinimapButton()
                 print("MochaAlerts: Config UI not found.")
             end
         end
-    end)
-
-    MA.MinimapButton = button
-    UpdateMinimapPos(button)
-end
-
--- Create the minimap button after PLAYER_LOGIN
-local f = CreateFrame("Frame")
-f:RegisterEvent("PLAYER_LOGIN")
-f:SetScript("OnEvent", function()
-    CreateMinimapButton()
-end)
+    end,
+    OnTooltipShow = function(tt)
+        tt:SetText("MochaAlerts", 1, 1, 1)
+        tt:AddLine("Left-click to open settings.", 0.8, 0.8, 0.8)
+        tt:Show()
+    end,
+})
 
 -- NOTE: In WoW 12.0.1+, neither SetCooldown() nor SetCooldownFromDurationObject()
 -- accept the Lua table from C_Spell.GetSpellCooldown (secret value restrictions).
@@ -2713,6 +2625,16 @@ frame:SetScript("OnEvent", function(_, event, ...)
                     end
                 end
             end
+            -- Migrate per-character minimap angle to account-wide LibDBIcon position
+            if MochaAlertsCharDB and MochaAlertsCharDB.minimapAngle then
+                MA.db.minimap = MA.db.minimap or {}
+                MA.db.minimap.minimapPos = MochaAlertsCharDB.minimapAngle
+                MochaAlertsCharDB.minimapAngle = nil
+            end
+
+            -- Register minimap button with LibDBIcon
+            LibStub("LibDBIcon-1.0"):Register("MochaAlerts", MochaAlertsLDB, MA.db.minimap)
+
             frame:UnregisterEvent("ADDON_LOADED")
         end
 
