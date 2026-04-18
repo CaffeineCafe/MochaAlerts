@@ -7,5 +7,9 @@
 ## SavedVariablesPerCharacter: MochaAlertsCharDB
 ## IconTexture: Interface\AddOns\MochaAlerts\Media\Textures\coffeeAlert
 
+Libs/LibStub.lua
+Libs/CallbackHandler-1.0.lua
+Libs/LibDataBroker-1.1.lua
+Libs/LibDBIcon-1.0.lua
 Core.lua
 Config.lua
