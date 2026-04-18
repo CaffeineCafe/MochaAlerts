@@ -30,6 +30,7 @@ local defaults = {
     pollInterval = 0.25, -- safety-net poll interval in seconds (0.01–0.40)
     alertFont = nil, -- nil = default Friz Quadrata; otherwise a bundled font path
     alertColor = {r = 0, g = 1, b = 0}, -- visual alert text color (default green)
+    quietLogin = false, -- suppress "MochaAlerts loaded" chat message
     minimap = {},  -- LibDBIcon position table
 }
 
@@ -2667,7 +2668,9 @@ frame:SetScript("OnEvent", function(_, event, ...)
                 end
             end
         end)
-        print("|cff00ff00MochaAlerts|r v1.2.2 loaded. Type |cff88bbff/malerts|r to configure.")
+        if not MA.db.quietLogin then
+            print("|cff00ff00MochaAlerts|r v1.2.3 loaded. Type |cff88bbff/malerts|r to configure.")
+        end
 
         -- Register in the in-game Addon settings list
         if Settings and Settings.RegisterCanvasLayoutCategory then
