@@ -3,8 +3,8 @@
 A World of Warcraft addon that plays voice and sound alerts when your tracked spells and items come off cooldown and are ready to cast.
 
 **Author:** CaffeineCafe  
-**Version:** 1.2.2  
-**Interface:** 120000 (The War Within / Midnight)
+**Version:** 1.3.0  
+**Interface:** 120005 (Midnight 12.0.5)
 
 ---
 
@@ -13,6 +13,9 @@ A World of Warcraft addon that plays voice and sound alerts when your tracked sp
 - **Text-to-Speech (TTS) alerts** — WoW's built-in TTS engine speaks the spell or item name when it's ready
 - **Sound effect alerts** — choose from 20+ Blizzard UI sounds or 60+ WeakAuras-style sound effects per spell/item
 - **Visual on-screen alerts** — animated text and icon overlay with configurable position and scale
+- **Per-alert flyout customization** — click a tracked spell or item to open a dedicated side panel for icon selection, positioning, scaling, and display options
+- **Independent icon/text placement** — unlink icon and text so they can be positioned and scaled separately anywhere on screen
+- **Unlock & Drag placement mode** — dimmed full-screen placement overlay lets you drag icon and text directly and fine-tune them with sliders
 - **Per-spell customization** — set a custom TTS phrase, custom on-screen text, toggle the icon and text, or enable a double-alert repeat
 - **Health Potion grouping** — all health pot variants share one alert entry so you're never spammed
 - **Fleeting potion grouping** — cauldron variants and their base potions are merged into one entry automatically
@@ -79,6 +82,30 @@ Each tracked entry has a row of buttons on the right side:
 | **X** | Remove this spell or item from tracking |
 
 When **TTS** mode is selected, a text box appears below the row where you can type a custom phrase (e.g. `"Chaos Strike"` instead of the default `"Annihilation ready"`). Leave it blank to use the default spell name.
+
+### Per-Alert Customization Panel
+
+Click the alert icon in a tracked row to open the customization flyout.
+
+| Control | Description |
+|---|---|
+| Current Mode | Shows whether icon and text are currently linked or unlinked |
+| Switch To Unlinked / Linked | Toggle between shared placement and independent placement |
+| Unlock & Drag | Open the dimmed full-screen placement mode for screen-based positioning |
+| Icon Picker | Choose a custom icon from the built-in searchable icon library |
+| Icon X / Y / Scale | Adjust icon placement and size when unlinked |
+| Text X / Y / Scale | Adjust text placement and size when unlinked |
+
+When unlinked, the icon and text use screen-based positions that are separate from the base alert anchor.
+
+### Unlock & Drag Mode
+
+Unlock & Drag opens a dimmed full-screen overlay where you can:
+
+- Drag the icon anywhere on screen
+- Drag the text anywhere on screen
+- Fine-tune icon and text X/Y/scale with sliders inside the overlay
+- Keep those placements fully separate from the base alert frame position
 
 ---
 
