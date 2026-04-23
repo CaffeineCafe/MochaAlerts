@@ -18,6 +18,15 @@ local tconcat = table.concat
 local ALERT_THROTTLE = 0.05
 local TTS_COALESCE_WINDOW = 0.020 -- brief window to catch truly simultaneous alerts before speaking
 local DEFAULT_POLL_INTERVAL = 0.25 -- fallback before DB loads; overridden by db.pollInterval
+local MYTHIC_RAID_DIFFICULTY_IDS = {
+    [16] = true,
+}
+local ALERT_CONTEXT_FIELDS = {
+    pvp = "fireInPvp",
+    fiveMan = "fireInFiveMan",
+    raid = "fireInRaid",
+    mythicRaid = "fireInMythicRaid",
+}
 
 -- Defaults
 local defaults = {
@@ -26,10 +35,13 @@ local defaults = {
     showVisual = true,
     alertScale = 1.0,
     alertPos = nil,  -- { point, relPoint, x, y }
+    configPos = nil, -- { point, relPoint, x, y } for config window position
     ttsVoice = 0,   -- 0-based index into C_VoiceChat.GetTtsVoices() (0 = first voice)
     pollInterval = 0.25, -- safety-net poll interval in seconds (0.01–0.40)
     alertFont = nil, -- nil = default Friz Quadrata; otherwise a bundled font path
     alertColor = {r = 0, g = 1, b = 0}, -- visual alert text color (default green)
+    quietLogin = false, -- suppress "MochaAlerts loaded" chat message
+    minimap = {},  -- LibDBIcon position table
 }
 
 -- Per-character defaults
@@ -66,100 +78,16 @@ MA.elapsed = 0
 MA.debugMode = false
 
 -------------------------------------------------------------------------------
--- Minimap Button (no library required)
+-- Minimap Button (LibDBIcon)
 -------------------------------------------------------------------------------
 
---[[
-    CreateMinimapButton
-    Creates a Blizzard-style minimap button for MochaAlerts, using a custom icon and proper layering.
-    - Uses Blizzard's border, background, and highlight textures.
-    - Icon is round-cropped and centered.
-    - Button is draggable and remembers its position as an angle around the minimap.
-    - Left-click toggles the config UI.
-]]
-local function CreateMinimapButton()
-    if MA.MinimapButton then return end
-
-    local BUTTON_SIZE = 32
-    local ICON_SIZE = 18
-    local BORDER_SIZE = 50
-    local BG_SIZE = 24
-    local HIGHLIGHT_SIZE = 32
-    local MINIMAP_RADIUS = 100
-
-    local function UpdateMinimapPos(btn)
-        local angle = (MochaAlertsCharDB and MochaAlertsCharDB.minimapAngle) or 215
-        local rad = math.rad(angle)
-        btn:ClearAllPoints()
-        btn:SetPoint("CENTER", Minimap, "CENTER", math.cos(rad) * MINIMAP_RADIUS, math.sin(rad) * MINIMAP_RADIUS)
-    end
-
-    local button = CreateFrame("Button", "MochaAlertsMinimapButton", Minimap)
-    button:SetSize(BUTTON_SIZE, BUTTON_SIZE)
-    button:SetFrameStrata("MEDIUM")
-    button:EnableMouse(true)
-    button:RegisterForDrag("LeftButton")
-
-    -- Background (Blizzard style)
-    local background = button:CreateTexture(nil, "BACKGROUND")
-    background:SetTexture(136467) -- "Interface\\Minimap\\UI-Minimap-Background"
-    background:SetSize(BG_SIZE, BG_SIZE)
-    background:SetPoint("CENTER", button, "CENTER", 0, 0)
-    button.background = background
-
-    -- Icon (custom, round crop)
-    local icon = button:CreateTexture(nil, "ARTWORK")
-    icon:SetTexture("Interface\\AddOns\\MochaAlerts\\Media\\Textures\\coffeeAlert.tga")
-    icon:SetSize(ICON_SIZE, ICON_SIZE)
-    icon:SetPoint("CENTER", button, "CENTER", 0, 0)
-    icon:SetTexCoord(0.1, 0.9, 0.1, 0.9)
-    button.icon = icon
-
-    -- Border (Blizzard style)
-    local border = button:CreateTexture(nil, "OVERLAY")
-    border:SetTexture(136430) -- "Interface\\Minimap\\MiniMap-TrackingBorder"
-    border:SetSize(BORDER_SIZE, BORDER_SIZE)
-    border:SetPoint("TOPLEFT", button, "TOPLEFT", 0, 0)
-    button.border = border
-
-    -- Highlight (Blizzard style)
-    local highlight = button:CreateTexture(nil, "HIGHLIGHT")
-    highlight:SetTexture(136477) -- "Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight"
-    highlight:SetSize(HIGHLIGHT_SIZE, HIGHLIGHT_SIZE)
-    highlight:SetPoint("CENTER", button, "CENTER", 0, 0)
-    button:SetHighlightTexture(highlight)
-
-    -- Drag to move around minimap (angle-locked, no free movement)
-    button:SetScript("OnDragStart", function(self)
-        self:SetScript("OnUpdate", function(self)
-            local scale = UIParent:GetEffectiveScale()
-            local cx, cy = GetCursorPosition()
-            local mx, my = Minimap:GetCenter()
-            cx, cy = cx / scale, cy / scale
-            local angle = math.deg(math.atan2(cy - my, cx - mx)) % 360
-            MochaAlertsCharDB = MochaAlertsCharDB or {}
-            MochaAlertsCharDB.minimapAngle = angle
-            UpdateMinimapPos(self)
-        end)
-    end)
-    button:SetScript("OnDragStop", function(self)
-        self:SetScript("OnUpdate", nil)
-        UpdateMinimapPos(self)
-    end)
-
-    -- Tooltip
-    button:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        GameTooltip:SetText("MochaAlerts", 1, 1, 1)
-        GameTooltip:AddLine("Left-click to open settings.", 0.8, 0.8, 0.8)
-        GameTooltip:Show()
-    end)
-    button:SetScript("OnLeave", function()
-        GameTooltip:Hide()
-    end)
-
-    -- Left-click to open config UI
-    button:SetScript("OnClick", function(self, btn)
+local MochaAlertsLDB = LibStub("LibDataBroker-1.1"):NewDataObject("MochaAlerts", {
+    type = "launcher",
+    text = "MochaAlerts",
+    label = "MochaAlerts",
+    icon = "Interface\\AddOns\\MochaAlerts\\Media\\Textures\\coffeeAlert.tga",
+    iconCoords = {0.1, 0.9, 0.1, 0.9},
+    OnClick = function(_, btn)
         if btn == "LeftButton" then
             if MA.ToggleConfig then
                 MA:ToggleConfig()
@@ -167,18 +95,13 @@ local function CreateMinimapButton()
                 print("MochaAlerts: Config UI not found.")
             end
         end
-    end)
-
-    MA.MinimapButton = button
-    UpdateMinimapPos(button)
-end
-
--- Create the minimap button after PLAYER_LOGIN
-local f = CreateFrame("Frame")
-f:RegisterEvent("PLAYER_LOGIN")
-f:SetScript("OnEvent", function()
-    CreateMinimapButton()
-end)
+    end,
+    OnTooltipShow = function(tt)
+        tt:SetText("MochaAlerts", 1, 1, 1)
+        tt:AddLine("Left-click to open settings.", 0.8, 0.8, 0.8)
+        tt:Show()
+    end,
+})
 
 -- NOTE: In WoW 12.0.1+, neither SetCooldown() nor SetCooldownFromDurationObject()
 -- accept the Lua table from C_Spell.GetSpellCooldown (secret value restrictions).
@@ -612,6 +535,222 @@ function MA:SetItemShowIcon(itemID, val)
     self.charDb.trackedItems[itemID] = data
 end
 
+function MA:GetSpellCustomIcon(spellID)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) == "table" and data.iconOverride and data.iconOverride > 0 then
+        return data.iconOverride
+    end
+    return nil
+end
+
+function MA:SetSpellCustomIcon(spellID, iconFileID)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    local n = tonumber(iconFileID)
+    data.iconOverride = (n and n > 0) and math.floor(n) or nil
+    self.charDb.trackedSpells[spellID] = data
+end
+
+function MA:GetItemCustomIcon(itemID)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) == "table" and data.iconOverride and data.iconOverride > 0 then
+        return data.iconOverride
+    end
+    return nil
+end
+
+function MA:SetItemCustomIcon(itemID, iconFileID)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    local n = tonumber(iconFileID)
+    data.iconOverride = (n and n > 0) and math.floor(n) or nil
+    self.charDb.trackedItems[itemID] = data
+end
+
+-------------------------------------------------------------------------------
+-- Independent Icon/Text Positioning (Spell)
+-------------------------------------------------------------------------------
+function MA:GetSpellIconTextLinked(spellID)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) == "table" and data.iconTextLinked ~= nil then
+        return data.iconTextLinked == true
+    end
+    return true
+end
+
+function MA:SetSpellIconTextLinked(spellID, linked)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.iconTextLinked = linked and true or false
+    self.charDb.trackedSpells[spellID] = data
+end
+
+function MA:GetSpellIconOffsetX(spellID)
+    local data = self.charDb.trackedSpells[spellID]
+    return (type(data) == "table" and data.iconOffsetX) or 0
+end
+
+function MA:SetSpellIconOffsetX(spellID, offset)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.iconOffsetX = (tonumber(offset) or 0)
+    self.charDb.trackedSpells[spellID] = data
+end
+
+function MA:GetSpellIconOffsetY(spellID)
+    local data = self.charDb.trackedSpells[spellID]
+    return (type(data) == "table" and data.iconOffsetY) or 0
+end
+
+function MA:SetSpellIconOffsetY(spellID, offset)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.iconOffsetY = (tonumber(offset) or 0)
+    self.charDb.trackedSpells[spellID] = data
+end
+
+function MA:GetSpellIconScale(spellID)
+    local data = self.charDb.trackedSpells[spellID]
+    return (type(data) == "table" and data.iconScale) or 1.0
+end
+
+function MA:SetSpellIconScale(spellID, scale)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    local s = tonumber(scale) or 1.0
+    data.iconScale = math.max(0.5, math.min(2.0, s))  -- clamp 0.5 to 2.0
+    self.charDb.trackedSpells[spellID] = data
+end
+
+function MA:GetSpellTextOffsetX(spellID)
+    local data = self.charDb.trackedSpells[spellID]
+    return (type(data) == "table" and data.textOffsetX) or 0
+end
+
+function MA:SetSpellTextOffsetX(spellID, offset)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.textOffsetX = (tonumber(offset) or 0)
+    self.charDb.trackedSpells[spellID] = data
+end
+
+function MA:GetSpellTextOffsetY(spellID)
+    local data = self.charDb.trackedSpells[spellID]
+    return (type(data) == "table" and data.textOffsetY) or 0
+end
+
+function MA:SetSpellTextOffsetY(spellID, offset)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.textOffsetY = (tonumber(offset) or 0)
+    self.charDb.trackedSpells[spellID] = data
+end
+
+function MA:GetSpellTextScale(spellID)
+    local data = self.charDb.trackedSpells[spellID]
+    return (type(data) == "table" and data.textScale) or 1.0
+end
+
+function MA:SetSpellTextScale(spellID, scale)
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    local s = tonumber(scale) or 1.0
+    data.textScale = math.max(0.5, math.min(2.0, s))  -- clamp 0.5 to 2.0
+    self.charDb.trackedSpells[spellID] = data
+end
+
+-------------------------------------------------------------------------------
+-- Independent Icon/Text Positioning (Item)
+-------------------------------------------------------------------------------
+function MA:GetItemIconTextLinked(itemID)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) == "table" and data.iconTextLinked ~= nil then
+        return data.iconTextLinked == true
+    end
+    return true
+end
+
+function MA:SetItemIconTextLinked(itemID, linked)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.iconTextLinked = linked and true or false
+    self.charDb.trackedItems[itemID] = data
+end
+
+function MA:GetItemIconOffsetX(itemID)
+    local data = self.charDb.trackedItems[itemID]
+    return (type(data) == "table" and data.iconOffsetX) or 0
+end
+
+function MA:SetItemIconOffsetX(itemID, offset)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.iconOffsetX = (tonumber(offset) or 0)
+    self.charDb.trackedItems[itemID] = data
+end
+
+function MA:GetItemIconOffsetY(itemID)
+    local data = self.charDb.trackedItems[itemID]
+    return (type(data) == "table" and data.iconOffsetY) or 0
+end
+
+function MA:SetItemIconOffsetY(itemID, offset)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.iconOffsetY = (tonumber(offset) or 0)
+    self.charDb.trackedItems[itemID] = data
+end
+
+function MA:GetItemIconScale(itemID)
+    local data = self.charDb.trackedItems[itemID]
+    return (type(data) == "table" and data.iconScale) or 1.0
+end
+
+function MA:SetItemIconScale(itemID, scale)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    local s = tonumber(scale) or 1.0
+    data.iconScale = math.max(0.5, math.min(2.0, s))  -- clamp 0.5 to 2.0
+    self.charDb.trackedItems[itemID] = data
+end
+
+function MA:GetItemTextOffsetX(itemID)
+    local data = self.charDb.trackedItems[itemID]
+    return (type(data) == "table" and data.textOffsetX) or 0
+end
+
+function MA:SetItemTextOffsetX(itemID, offset)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.textOffsetX = (tonumber(offset) or 0)
+    self.charDb.trackedItems[itemID] = data
+end
+
+function MA:GetItemTextOffsetY(itemID)
+    local data = self.charDb.trackedItems[itemID]
+    return (type(data) == "table" and data.textOffsetY) or 0
+end
+
+function MA:SetItemTextOffsetY(itemID, offset)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data.textOffsetY = (tonumber(offset) or 0)
+    self.charDb.trackedItems[itemID] = data
+end
+
+function MA:GetItemTextScale(itemID)
+    local data = self.charDb.trackedItems[itemID]
+    return (type(data) == "table" and data.textScale) or 1.0
+end
+
+function MA:SetItemTextScale(itemID, scale)
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    local s = tonumber(scale) or 1.0
+    data.textScale = math.max(0.5, math.min(2.0, s))  -- clamp 0.5 to 2.0
+    self.charDb.trackedItems[itemID] = data
+end
+
 function MA:GetSpellShowText(spellID)
     local data = self.charDb.trackedSpells[spellID]
     if type(data) == "table" and data.showText == false then return false end
@@ -664,6 +803,83 @@ function MA:SetItemDoubleAlert(itemID, val)
     self.charDb.trackedItems[itemID] = data
 end
 
+local function IsAlertContextFilteringEnabled(data)
+    if type(data) ~= "table" then return false end
+    for _, field in pairs(ALERT_CONTEXT_FIELDS) do
+        if data[field] == true then
+            return true
+        end
+    end
+    return false
+end
+
+function MA:GetCurrentAlertContext()
+    local _, instanceType, difficultyID = GetInstanceInfo()
+
+    if instanceType == "pvp" or instanceType == "arena" then
+        return "pvp"
+    end
+
+    if instanceType == "party" then
+        return "fiveMan"
+    end
+
+    if instanceType == "raid" then
+        if MYTHIC_RAID_DIFFICULTY_IDS[difficultyID] then
+            return "mythicRaid"
+        end
+        return "raid"
+    end
+
+    return nil
+end
+
+function MA:IsAlertAllowedInCurrentContext(data)
+    if not IsAlertContextFilteringEnabled(data) then
+        return true
+    end
+
+    local currentContext = self:GetCurrentAlertContext()
+    if not currentContext then
+        return false
+    end
+
+    local field = ALERT_CONTEXT_FIELDS[currentContext]
+    return field and data[field] == true or false
+end
+
+function MA:GetSpellContextEnabled(spellID, key)
+    local data = self.charDb.trackedSpells[spellID]
+    local field = ALERT_CONTEXT_FIELDS[key]
+    if not field or type(data) ~= "table" then return false end
+    return data[field] == true
+end
+
+function MA:SetSpellContextEnabled(spellID, key, enabled)
+    local field = ALERT_CONTEXT_FIELDS[key]
+    if not field then return end
+    local data = self.charDb.trackedSpells[spellID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data[field] = enabled and true or nil
+    self.charDb.trackedSpells[spellID] = data
+end
+
+function MA:GetItemContextEnabled(itemID, key)
+    local data = self.charDb.trackedItems[itemID]
+    local field = ALERT_CONTEXT_FIELDS[key]
+    if not field or type(data) ~= "table" then return false end
+    return data[field] == true
+end
+
+function MA:SetItemContextEnabled(itemID, key, enabled)
+    local field = ALERT_CONTEXT_FIELDS[key]
+    if not field then return end
+    local data = self.charDb.trackedItems[itemID]
+    if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
+    data[field] = enabled and true or nil
+    self.charDb.trackedItems[itemID] = data
+end
+
 -------------------------------------------------------------------------------
 -- Visual Alert (safe custom frame — never touches protected UIErrorsFrame)
 -------------------------------------------------------------------------------
@@ -673,6 +889,8 @@ end
 -------------------------------------------------------------------------------
 local ALERT_POOL_SIZE  = 4
 local ALERT_SCALE_STEP = 0.10   -- each higher slot is this much smaller
+local ALERT_ICON_BASE_SIZE = 40
+local ALERT_TEXT_BASE_SIZE = 24
 
 function MA:CreateAlertFrame()
     if self.alertPool[1] then return end
@@ -716,14 +934,14 @@ function MA:CreateAlertFrame()
         end
 
         local icon = f:CreateTexture(nil, "OVERLAY")
-        icon:SetSize(40, 40)
+        icon:SetSize(ALERT_ICON_BASE_SIZE, ALERT_ICON_BASE_SIZE)
         icon:SetPoint("BOTTOM", f, "CENTER", 0, 2)
         icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         icon:Hide()
         f.icon = icon
 
         local text = f:CreateFontString(nil, "OVERLAY")
-        text:SetFont(self:GetAlertFontPath(), 24, "OUTLINE")
+        text:SetFont(self:GetAlertFontPath(), ALERT_TEXT_BASE_SIZE, "OUTLINE")
         text:SetPoint("TOP", f, "CENTER", 0, -2)
         f.text = text
 
@@ -772,7 +990,7 @@ function MA:CreateAlertFrame()
     self.alertFrame = self.alertPool[1]  -- backward-compat for unlock/scale/reset
 end
 
-function MA:ShowAlertText(msg, spellID, itemID)
+function MA:ShowAlertText(msg, spellID, itemID, forcedIconTexture)
     self:CreateAlertFrame()
 
     -- Pick the lowest-indexed free slot so stacking is as low as possible
@@ -821,32 +1039,114 @@ function MA:ShowAlertText(msg, spellID, itemID)
         showIcon = self:GetItemShowIcon(itemID)
     end
     local iconTexture = nil
-    if showIcon and spellID then
-        local info = C_Spell.GetSpellInfo(spellID)
-        if info then
-            iconTexture = info.iconID
+    if forcedIconTexture then
+        showIcon = true
+        iconTexture = forcedIconTexture
+    else
+        if showIcon and spellID then
+            iconTexture = self:GetSpellCustomIcon(spellID)
+            if not iconTexture then
+                local info = C_Spell.GetSpellInfo(spellID)
+                if info then
+                    iconTexture = info.iconID
+                end
+            end
         end
-    end
-    if showIcon and itemID and not iconTexture then
-        iconTexture = C_Item.GetItemIconByID(itemID)
+        if showIcon and itemID and not iconTexture then
+            iconTexture = self:GetItemCustomIcon(itemID) or C_Item.GetItemIconByID(itemID)
+        end
     end
 
     if showIcon and iconTexture then
         f.icon:SetTexture(iconTexture)
         f.icon:Show()
         f.icon:ClearAllPoints()
-        if showText then
-            f.icon:SetPoint("BOTTOM", f, "CENTER", 0, 2)
-            f.text:ClearAllPoints()
-            f.text:SetPoint("TOP", f, "CENTER", 0, -2)
+        
+        -- Check if icon and text are linked (independent positioning)
+        local isLinked = true
+        if spellID then
+            isLinked = self:GetSpellIconTextLinked(spellID)
+        elseif itemID then
+            isLinked = self:GetItemIconTextLinked(itemID)
+        end
+        
+        if isLinked then
+            -- Linked: keep icon and text together (existing behavior)
+            if showText then
+                f.icon:SetPoint("BOTTOM", f, "CENTER", 0, 2)
+                f.text:ClearAllPoints()
+                f.text:SetPoint("TOP", f, "CENTER", 0, -2)
+                f.text:SetFont(self:GetAlertFontPath(), ALERT_TEXT_BASE_SIZE, "OUTLINE")
+            else
+                f.icon:SetPoint("CENTER", f, "CENTER", 0, 0)
+            end
+            f.icon:SetSize(ALERT_ICON_BASE_SIZE, ALERT_ICON_BASE_SIZE)
         else
-            f.icon:SetPoint("CENTER", f, "CENTER", 0, 0)
+            -- Unlinked: apply independent positioning and scaling
+            local iconScale = 1.0
+            local iconOffsetX, iconOffsetY = 0, 0
+            local textScale = 1.0
+            local textOffsetX, textOffsetY = 0, 0
+            
+            if spellID then
+                iconScale = self:GetSpellIconScale(spellID)
+                iconOffsetX = self:GetSpellIconOffsetX(spellID)
+                iconOffsetY = self:GetSpellIconOffsetY(spellID)
+                textScale = self:GetSpellTextScale(spellID)
+                textOffsetX = self:GetSpellTextOffsetX(spellID)
+                textOffsetY = self:GetSpellTextOffsetY(spellID)
+            elseif itemID then
+                iconScale = self:GetItemIconScale(itemID)
+                iconOffsetX = self:GetItemIconOffsetX(itemID)
+                iconOffsetY = self:GetItemIconOffsetY(itemID)
+                textScale = self:GetItemTextScale(itemID)
+                textOffsetX = self:GetItemTextOffsetX(itemID)
+                textOffsetY = self:GetItemTextOffsetY(itemID)
+            end
+            
+            -- Position icon independently against the screen, not the base alert anchor.
+            f.icon:SetPoint("CENTER", UIParent, "CENTER", iconOffsetX, iconOffsetY)
+            local iconSize = math.max(12, math.floor(ALERT_ICON_BASE_SIZE * iconScale + 0.5))
+            f.icon:SetSize(iconSize, iconSize)
+            
+            -- Position text with independent scale and offset
+            if showText then
+                f.text:ClearAllPoints()
+                f.text:SetPoint("CENTER", UIParent, "CENTER", textOffsetX, textOffsetY)
+                local fontSize = math.max(8, math.floor(ALERT_TEXT_BASE_SIZE * textScale + 0.5))
+                f.text:SetFont(self:GetAlertFontPath(), fontSize, "OUTLINE")
+            end
         end
     else
         f.icon:Hide()
         if showText then
+            local isLinked = true
+            if spellID then
+                isLinked = self:GetSpellIconTextLinked(spellID)
+            elseif itemID then
+                isLinked = self:GetItemIconTextLinked(itemID)
+            end
+
             f.text:ClearAllPoints()
-            f.text:SetPoint("TOP", f, "CENTER", 0, 12)
+            if isLinked then
+                f.text:SetPoint("TOP", f, "CENTER", 0, 12)
+                f.text:SetFont(self:GetAlertFontPath(), ALERT_TEXT_BASE_SIZE, "OUTLINE")
+            else
+                local textScale = 1.0
+                local textOffsetX, textOffsetY = 0, 0
+                if spellID then
+                    textScale = self:GetSpellTextScale(spellID)
+                    textOffsetX = self:GetSpellTextOffsetX(spellID)
+                    textOffsetY = self:GetSpellTextOffsetY(spellID)
+                elseif itemID then
+                    textScale = self:GetItemTextScale(itemID)
+                    textOffsetX = self:GetItemTextOffsetX(itemID)
+                    textOffsetY = self:GetItemTextOffsetY(itemID)
+                end
+                f.text:SetPoint("CENTER", UIParent, "CENTER", textOffsetX, textOffsetY)
+                local fontSize = math.max(8, math.floor(ALERT_TEXT_BASE_SIZE * textScale + 0.5))
+                f.text:SetFont(self:GetAlertFontPath(), fontSize, "OUTLINE")
+            end
         end
     end
 
@@ -900,10 +1200,447 @@ function MA:ResetAlertPosition()
     end
 end
 
+-- Show full-screen positioning UI where icon and text can be placed anywhere on screen.
+function MA:ShowDragPreview(spellID, isItem)
+    if not self.positioningModeFrame then
+        local container
+
+        local function Clamp(value, minValue, maxValue)
+            if value < minValue then return minValue end
+            if value > maxValue then return maxValue end
+            return value
+        end
+
+        local function GetCurrentValues(container)
+            if container._currentIsItem then
+                return {
+                    iconOffsetX = MA:GetItemIconOffsetX(container._currentSpellID),
+                    iconOffsetY = MA:GetItemIconOffsetY(container._currentSpellID),
+                    iconScale = MA:GetItemIconScale(container._currentSpellID),
+                    textOffsetX = MA:GetItemTextOffsetX(container._currentSpellID),
+                    textOffsetY = MA:GetItemTextOffsetY(container._currentSpellID),
+                    textScale = MA:GetItemTextScale(container._currentSpellID),
+                }
+            end
+
+            return {
+                iconOffsetX = MA:GetSpellIconOffsetX(container._currentSpellID),
+                iconOffsetY = MA:GetSpellIconOffsetY(container._currentSpellID),
+                iconScale = MA:GetSpellIconScale(container._currentSpellID),
+                textOffsetX = MA:GetSpellTextOffsetX(container._currentSpellID),
+                textOffsetY = MA:GetSpellTextOffsetY(container._currentSpellID),
+                textScale = MA:GetSpellTextScale(container._currentSpellID),
+            }
+        end
+
+        local function SaveHandlePosition(container, kind, offsetX, offsetY)
+            if not container._currentSpellID then return end
+            if kind == "icon" then
+                if container._currentIsItem then
+                    MA:SetItemIconOffsetX(container._currentSpellID, offsetX)
+                    MA:SetItemIconOffsetY(container._currentSpellID, offsetY)
+                else
+                    MA:SetSpellIconOffsetX(container._currentSpellID, offsetX)
+                    MA:SetSpellIconOffsetY(container._currentSpellID, offsetY)
+                end
+            elseif kind == "text" then
+                if container._currentIsItem then
+                    MA:SetItemTextOffsetX(container._currentSpellID, offsetX)
+                    MA:SetItemTextOffsetY(container._currentSpellID, offsetY)
+                else
+                    MA:SetSpellTextOffsetX(container._currentSpellID, offsetX)
+                    MA:SetSpellTextOffsetY(container._currentSpellID, offsetY)
+                end
+            end
+        end
+
+        local function SaveScaleValue(container, kind, scale)
+            if not container._currentSpellID then return end
+            if kind == "icon" then
+                if container._currentIsItem then
+                    MA:SetItemIconScale(container._currentSpellID, scale)
+                else
+                    MA:SetSpellIconScale(container._currentSpellID, scale)
+                end
+            elseif kind == "text" then
+                if container._currentIsItem then
+                    MA:SetItemTextScale(container._currentSpellID, scale)
+                else
+                    MA:SetSpellTextScale(container._currentSpellID, scale)
+                end
+            end
+        end
+
+        local function ApplyOverlayState(container)
+            if not container._currentSpellID then return end
+
+            local values = GetCurrentValues(container)
+            local overlayIconSize = math.max(18, math.floor(54 * values.iconScale + 0.5))
+            local overlayTextureSize = math.max(14, math.floor(42 * values.iconScale + 0.5))
+            local overlayTextSize = math.max(10, math.floor(ALERT_TEXT_BASE_SIZE * values.textScale + 0.5))
+            container.iconHandle:SetSize(overlayIconSize, overlayIconSize)
+            container.iconTex:SetSize(overlayTextureSize, overlayTextureSize)
+            container.textStr:SetFont(MA:GetAlertFontPath(), overlayTextSize, "OUTLINE")
+            local textWidth = math.max(120, math.floor(container.textStr:GetStringWidth() + 24))
+            local textHeight = math.max(28, overlayTextSize + 14)
+            container.textHandle:SetSize(textWidth, textHeight)
+
+            container.iconHandle:ClearAllPoints()
+            container.iconHandle:SetPoint("CENTER", UIParent, "CENTER", values.iconOffsetX, values.iconOffsetY)
+            container.textHandle:ClearAllPoints()
+            container.textHandle:SetPoint("CENTER", UIParent, "CENTER", values.textOffsetX, values.textOffsetY)
+
+            container.updatingControls = true
+            container.iconXSlider:SetValue(values.iconOffsetX)
+            container.iconYSlider:SetValue(values.iconOffsetY)
+            container.iconScaleSlider:SetValue(values.iconScale)
+            container.textXSlider:SetValue(values.textOffsetX)
+            container.textYSlider:SetValue(values.textOffsetY)
+            container.textScaleSlider:SetValue(values.textScale)
+            container.updatingControls = false
+        end
+
+        local function MakeOverlaySlider(parent, anchor, labelText, minValue, maxValue, step, onValueChanged)
+            local label = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -10)
+            label:SetTextColor(0.88, 0.78, 0.62)
+            label:SetText(labelText)
+
+            local valueLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            valueLabel:SetPoint("LEFT", label, "RIGHT", 10, 0)
+            valueLabel:SetTextColor(0.92, 0.68, 0.22)
+            valueLabel:SetText("0")
+
+            local slider = CreateFrame("Slider", nil, parent, "OptionsSliderTemplate")
+            slider:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -10)
+            slider:SetWidth(180)
+            slider:SetHeight(12)
+            slider.Low:SetText("")
+            slider.High:SetText("")
+            slider:SetMinMaxValues(minValue, maxValue)
+            slider:SetValueStep(step)
+            slider:SetObeyStepOnDrag(true)
+            slider:SetScript("OnValueChanged", function(self, value)
+                if step >= 1 then
+                    value = math.floor(value + 0.5)
+                    valueLabel:SetText(tostring(value))
+                else
+                    value = math.floor(value * 10 + 0.5) / 10
+                    valueLabel:SetText(string.format("%.1f", value))
+                end
+                if container.updatingControls then return end
+                onValueChanged(value)
+            end)
+            if slider:GetThumbTexture() then
+                slider:GetThumbTexture():SetVertexColor(0.92, 0.68, 0.22)
+            end
+
+            return slider, label, valueLabel
+        end
+
+        local function EndHandleDrag(container)
+            if container.draggingHandle == container.iconHandle then
+                container.iconBg:SetColorTexture(0.18, 0.18, 0.18, 0.75)
+            elseif container.draggingHandle == container.textHandle then
+                container.textBg:SetColorTexture(0.18, 0.18, 0.18, 0.75)
+            end
+            container.draggingHandle = nil
+            container.draggingKind = nil
+            ApplyOverlayState(container)
+            if MA.sidePanel and MA.sidePanel.currentSpellID == container._currentSpellID then
+                MA.sidePanel.RefreshControls()
+            end
+        end
+
+        container = CreateFrame("Frame", "MochaAlertsPositioningMode", UIParent)
+        container:SetAllPoints(UIParent)
+        container:SetFrameStrata("FULLSCREEN_DIALOG")
+        container:SetFrameLevel(1000)
+        container:EnableMouse(true)
+
+        local shade = container:CreateTexture(nil, "BACKGROUND")
+        shade:SetAllPoints()
+        shade:SetColorTexture(0.02, 0.02, 0.02, 0.35)
+
+        local panel = CreateFrame("Frame", nil, container)
+        panel:SetSize(420, 410)
+        panel:SetPoint("TOP", UIParent, "TOP", 0, -100)
+
+        local panelBg = panel:CreateTexture(nil, "BACKGROUND")
+        panelBg:SetAllPoints()
+        panelBg:SetColorTexture(0.08, 0.08, 0.08, 0.95)
+
+        local panelBorder = panel:CreateTexture(nil, "BORDER")
+        panelBorder:SetPoint("TOPLEFT", -2, 2)
+        panelBorder:SetPoint("BOTTOMRIGHT", 2, -2)
+        panelBorder:SetColorTexture(0.92, 0.68, 0.22, 1)
+        panelBg:SetDrawLayer("BACKGROUND", 1)
+        panelBorder:SetDrawLayer("BACKGROUND", 0)
+
+        local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        title:SetPoint("TOPLEFT", 12, -10)
+        title:SetTextColor(0.92, 0.68, 0.22)
+        title:SetText("Unlock & Drag")
+
+        local instructions = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        instructions:SetPoint("TOPLEFT", 12, -30)
+        instructions:SetWidth(392)
+        instructions:SetJustifyH("LEFT")
+        instructions:SetWordWrap(true)
+        instructions:SetTextColor(0.88, 0.78, 0.62)
+        instructions:SetText("Drag the icon and text anywhere on the screen. These positions are separate from the base alert anchor. You can also fine-tune them with the sliders below.")
+
+        local closeBtn = CreateFrame("Button", nil, panel)
+        closeBtn:SetSize(22, 22)
+        closeBtn:SetPoint("TOPRIGHT", -8, -8)
+        closeBtn:EnableMouse(true)
+        closeBtn:RegisterForClicks("LeftButtonUp")
+
+        local closeBg = closeBtn:CreateTexture(nil, "BACKGROUND")
+        closeBg:SetAllPoints()
+        closeBg:SetColorTexture(0.3, 0.1, 0.1, 0.9)
+
+        local closeText = closeBtn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        closeText:SetPoint("CENTER")
+        closeText:SetText("X")
+        closeText:SetTextColor(1, 1, 1)
+        closeBtn:SetScript("OnClick", function() container:Hide() end)
+
+        local iconSection = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        iconSection:SetPoint("TOPLEFT", 12, -80)
+        iconSection:SetTextColor(0.92, 0.68, 0.22)
+        iconSection:SetText("Icon")
+
+        local textSection = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        textSection:SetPoint("TOPLEFT", 222, -80)
+        textSection:SetTextColor(0.92, 0.68, 0.22)
+        textSection:SetText("Text")
+
+        local iconXSlider = MakeOverlaySlider(panel, iconSection, "X Offset", -2000, 2000, 1, function(value)
+            SaveHandlePosition(container, "icon", value, GetCurrentValues(container).iconOffsetY)
+            ApplyOverlayState(container)
+            if MA.sidePanel and MA.sidePanel.currentSpellID == container._currentSpellID then MA.sidePanel.RefreshControls() end
+        end)
+        local iconYSlider = MakeOverlaySlider(panel, iconXSlider, "Y Offset", -2000, 2000, 1, function(value)
+            SaveHandlePosition(container, "icon", GetCurrentValues(container).iconOffsetX, value)
+            ApplyOverlayState(container)
+            if MA.sidePanel and MA.sidePanel.currentSpellID == container._currentSpellID then MA.sidePanel.RefreshControls() end
+        end)
+        local iconScaleSlider = MakeOverlaySlider(panel, iconYSlider, "Scale", 0.5, 2.0, 0.1, function(value)
+            SaveScaleValue(container, "icon", value)
+            ApplyOverlayState(container)
+            if MA.sidePanel and MA.sidePanel.currentSpellID == container._currentSpellID then MA.sidePanel.RefreshControls() end
+        end)
+
+        iconXSlider:SetPoint("TOPLEFT", 12, -110)
+        iconYSlider:SetPoint("TOPLEFT", 12, -190)
+        iconScaleSlider:SetPoint("TOPLEFT", 12, -270)
+
+        local textXSlider = MakeOverlaySlider(panel, textSection, "X Offset", -2000, 2000, 1, function(value)
+            SaveHandlePosition(container, "text", value, GetCurrentValues(container).textOffsetY)
+            ApplyOverlayState(container)
+            if MA.sidePanel and MA.sidePanel.currentSpellID == container._currentSpellID then MA.sidePanel.RefreshControls() end
+        end)
+        local textYSlider = MakeOverlaySlider(panel, textXSlider, "Y Offset", -2000, 2000, 1, function(value)
+            SaveHandlePosition(container, "text", GetCurrentValues(container).textOffsetX, value)
+            ApplyOverlayState(container)
+            if MA.sidePanel and MA.sidePanel.currentSpellID == container._currentSpellID then MA.sidePanel.RefreshControls() end
+        end)
+        local textScaleSlider = MakeOverlaySlider(panel, textYSlider, "Scale", 0.5, 2.0, 0.1, function(value)
+            SaveScaleValue(container, "text", value)
+            ApplyOverlayState(container)
+            if MA.sidePanel and MA.sidePanel.currentSpellID == container._currentSpellID then MA.sidePanel.RefreshControls() end
+        end)
+
+        textXSlider:SetPoint("TOPLEFT", 222, -110)
+        textYSlider:SetPoint("TOPLEFT", 222, -190)
+        textScaleSlider:SetPoint("TOPLEFT", 222, -270)
+
+        local centerMarkerH = container:CreateTexture(nil, "ARTWORK")
+        centerMarkerH:SetSize(44, 2)
+        centerMarkerH:SetPoint("CENTER", UIParent, "CENTER")
+        centerMarkerH:SetColorTexture(0.92, 0.68, 0.22, 0.45)
+
+        local centerMarkerV = container:CreateTexture(nil, "ARTWORK")
+        centerMarkerV:SetSize(2, 44)
+        centerMarkerV:SetPoint("CENTER", UIParent, "CENTER")
+        centerMarkerV:SetColorTexture(0.92, 0.68, 0.22, 0.45)
+
+        local iconHandle = CreateFrame("Button", nil, container)
+        iconHandle:SetSize(54, 54)
+        iconHandle:EnableMouse(true)
+        iconHandle:RegisterForClicks("LeftButtonDown", "LeftButtonUp")
+
+        local iconBg = iconHandle:CreateTexture(nil, "BACKGROUND")
+        iconBg:SetAllPoints()
+        iconBg:SetColorTexture(0.18, 0.18, 0.18, 0.75)
+
+        local iconTex = iconHandle:CreateTexture(nil, "ARTWORK")
+        iconTex:SetSize(42, 42)
+        iconTex:SetPoint("CENTER")
+
+        local iconBorder = iconHandle:CreateTexture(nil, "BORDER")
+        iconBorder:SetPoint("TOPLEFT", -2, 2)
+        iconBorder:SetPoint("BOTTOMRIGHT", 2, -2)
+        iconBorder:SetColorTexture(0.92, 0.68, 0.22, 0.8)
+
+        local textHandle = CreateFrame("Button", nil, container)
+        textHandle:SetSize(200, 36)
+        textHandle:EnableMouse(true)
+        textHandle:RegisterForClicks("LeftButtonDown", "LeftButtonUp")
+
+        local textBg = textHandle:CreateTexture(nil, "BACKGROUND")
+        textBg:SetAllPoints()
+        textBg:SetColorTexture(0.18, 0.18, 0.18, 0.75)
+
+        local textBorder = textHandle:CreateTexture(nil, "BORDER")
+        textBorder:SetPoint("TOPLEFT", -2, 2)
+        textBorder:SetPoint("BOTTOMRIGHT", 2, -2)
+        textBorder:SetColorTexture(0.92, 0.68, 0.22, 0.8)
+
+        local textStr = textHandle:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
+        textStr:SetPoint("CENTER")
+        textStr:SetTextColor(0, 1, 0, 1)
+        textStr:SetText("Ready")
+
+        container.panel = panel
+        container.iconHandle = iconHandle
+        container.textHandle = textHandle
+        container.iconTex = iconTex
+        container.textStr = textStr
+        container.iconBg = iconBg
+        container.textBg = textBg
+        container.ApplyOverlayState = ApplyOverlayState
+        container.iconXSlider = iconXSlider
+        container.iconYSlider = iconYSlider
+        container.iconScaleSlider = iconScaleSlider
+        container.textXSlider = textXSlider
+        container.textYSlider = textYSlider
+        container.textScaleSlider = textScaleSlider
+
+        iconHandle:SetScript("OnMouseDown", function(self, btn)
+            if btn == "LeftButton" then
+                container.draggingHandle = self
+                container.draggingKind = "icon"
+                container.dragOffsetX = nil
+                container.dragOffsetY = nil
+                iconBg:SetColorTexture(0.78, 0.60, 0.18, 0.85)
+            end
+        end)
+
+        iconHandle:SetScript("OnMouseUp", function(self, btn)
+            if btn == "LeftButton" then
+                EndHandleDrag(container)
+            end
+        end)
+
+        textHandle:SetScript("OnMouseDown", function(self, btn)
+            if btn == "LeftButton" then
+                container.draggingHandle = self
+                container.draggingKind = "text"
+                container.dragOffsetX = nil
+                container.dragOffsetY = nil
+                textBg:SetColorTexture(0.78, 0.60, 0.18, 0.85)
+            end
+        end)
+
+        textHandle:SetScript("OnMouseUp", function(self, btn)
+            if btn == "LeftButton" then
+                EndHandleDrag(container)
+            end
+        end)
+
+        container:SetScript("OnMouseUp", function(self, btn)
+            if btn == "LeftButton" then
+                EndHandleDrag(self)
+            end
+        end)
+
+        container:SetScript("OnUpdate", function(self)
+            if not self.draggingHandle then return end
+
+            local scale = UIParent:GetEffectiveScale()
+            local cursorX, cursorY = GetCursorPosition()
+            cursorX = cursorX / scale
+            cursorY = cursorY / scale
+
+            local screenCenterX, screenCenterY = UIParent:GetCenter()
+            if not self.dragOffsetX or not self.dragOffsetY then
+                local handleCenterX, handleCenterY = self.draggingHandle:GetCenter()
+                self.dragOffsetX = handleCenterX - cursorX
+                self.dragOffsetY = handleCenterY - cursorY
+            end
+
+            local handleScale = self.draggingHandle:GetScale() or 1
+            local halfWidth = (self.draggingHandle:GetWidth() * handleScale) / 2
+            local halfHeight = (self.draggingHandle:GetHeight() * handleScale) / 2
+            local minX = -(UIParent:GetWidth() / 2) + halfWidth
+            local maxX = (UIParent:GetWidth() / 2) - halfWidth
+            local minY = -(UIParent:GetHeight() / 2) + halfHeight
+            local maxY = (UIParent:GetHeight() / 2) - halfHeight
+
+            local offsetX = Clamp(cursorX + self.dragOffsetX - screenCenterX, minX, maxX)
+            local offsetY = Clamp(cursorY + self.dragOffsetY - screenCenterY, minY, maxY)
+
+            self.draggingHandle:ClearAllPoints()
+            self.draggingHandle:SetPoint("CENTER", UIParent, "CENTER", offsetX, offsetY)
+            SaveHandlePosition(self, self.draggingKind, math.floor(offsetX + 0.5), math.floor(offsetY + 0.5))
+            ApplyOverlayState(self)
+        end)
+
+        self.positioningModeFrame = container
+    end
+
+    local container = self.positioningModeFrame
+    container._currentSpellID = spellID
+    container._currentIsItem = isItem
+
+    local iconTexture
+    local iconScale
+    local iconOffsetX
+    local iconOffsetY
+    local textScale
+    local textOffsetX
+    local textOffsetY
+    local displayName
+
+    if isItem then
+        iconTexture = self:GetItemCustomIcon(spellID) or C_Item.GetItemIconByID(spellID) or 134400
+        iconScale = self:GetItemIconScale(spellID)
+        iconOffsetX = self:GetItemIconOffsetX(spellID)
+        iconOffsetY = self:GetItemIconOffsetY(spellID)
+        textScale = self:GetItemTextScale(spellID)
+        textOffsetX = self:GetItemTextOffsetX(spellID)
+        textOffsetY = self:GetItemTextOffsetY(spellID)
+        displayName = self:GetItemDisplayName(spellID) or "Item Ready"
+    else
+        iconTexture = self:GetSpellCustomIcon(spellID) or C_Spell.GetSpellTexture(spellID) or 134400
+        iconScale = self:GetSpellIconScale(spellID)
+        iconOffsetX = self:GetSpellIconOffsetX(spellID)
+        iconOffsetY = self:GetSpellIconOffsetY(spellID)
+        textScale = self:GetSpellTextScale(spellID)
+        textOffsetX = self:GetSpellTextOffsetX(spellID)
+        textOffsetY = self:GetSpellTextOffsetY(spellID)
+        displayName = (C_Spell.GetSpellName(spellID) or "Spell") .. " Ready"
+    end
+
+    container.iconTex:SetTexture(iconTexture)
+    container.textStr:SetText(displayName)
+    container.draggingHandle = nil
+    container.draggingKind = nil
+    container:ApplyOverlayState()
+    container:Show()
+    container:Raise()
+end
+
 -------------------------------------------------------------------------------
 -- TTS (Text-to-Speech)
 -------------------------------------------------------------------------------
-function MA:GetTTSVoices()
+function MA:GetTTSVoices(forceRefresh)
+    if forceRefresh then
+        self._cachedVoices = nil
+        self._cachedSelectedVoice = nil
+    end
     if self._cachedVoices then return self._cachedVoices end
     if C_VoiceChat and C_VoiceChat.GetTtsVoices then
         local ok, voices = pcall(C_VoiceChat.GetTtsVoices)
@@ -920,6 +1657,10 @@ function MA:GetSelectedVoice()
     local voices = self:GetTTSVoices()
     if not voices then return nil end
     local idx = (self.db.ttsVoice or 0) + 1
+    if idx < 1 or idx > #voices then
+        idx = 1
+        self.db.ttsVoice = 0
+    end
     local voice = voices[idx] or voices[1]
     self._cachedSelectedVoice = voice
     return voice
@@ -1121,13 +1862,19 @@ end
 -------------------------------------------------------------------------------
 -- Alert Dispatch
 -------------------------------------------------------------------------------
-function MA:Speak(text, spellID)
+function MA:Speak(text, spellID, forcedIconTexture, chargeCount)
     if not self.db or not self.db.enabled then
         if self.debugMode then print("|cffff0000MochaAlerts DBG:|r Blocked - disabled") end
         return
     end
     if not self.db.alertInCombat and InCombatLockdown() then
         if self.debugMode then print("|cffff0000MochaAlerts DBG:|r Blocked - combat setting off") end
+        return
+    end
+
+    local data = spellID and self.charDb.trackedSpells[spellID]
+    if not self:IsAlertAllowedInCurrentContext(data) then
+        if self.debugMode then print("|cffff0000MochaAlerts DBG:|r Blocked - spell context filter") end
         return
     end
 
@@ -1143,12 +1890,16 @@ function MA:Speak(text, spellID)
         print("|cff00ff00MochaAlerts DBG:|r >>> " .. text)
     end
 
+    local chargePrefix = ""
+    if chargeCount and chargeCount > 0 then
+        chargePrefix = tostring(chargeCount) .. " "
+    end
+
     -- Per-spell mode and custom TTS text (single table lookup)
-    local data = spellID and self.charDb.trackedSpells[spellID]
     local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
         local ttsText = (type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil
-        self:_QueueTTS(ttsText or text)
+        self:_QueueTTS(chargePrefix .. (ttsText or text))
     elseif mode ~= "none" then
         local soundKey = (type(data) == "table" and data.sound) or "RaidWarning"
         self:PlaySoundByKey(soundKey)
@@ -1157,31 +1908,36 @@ function MA:Speak(text, spellID)
     -- Visual feedback (custom frame is safe during combat)
     if self.db.showVisual then
         local visText = (type(data) == "table" and data.displayText ~= "" and data.displayText) or text
-        self:ShowAlertText(self:GetAlertColorHex() .. visText .. "|r", spellID, nil)
+        self:ShowAlertText(self:GetAlertColorHex() .. chargePrefix .. visText .. "|r", spellID, nil, forcedIconTexture)
     end
 
     -- Double-alert: schedule a second fire after 1.5s when x2 is enabled
     if spellID and self:GetSpellDoubleAlert(spellID) then
-        C_Timer.After(1.5, function() MA:_SpeakRaw(text, spellID) end)
+        C_Timer.After(1.5, function() MA:_SpeakRaw(text, spellID, chargeCount) end)
     end
 end
 
 -- Raw spell alert -- bypasses throttle, used only for x2 repeat
-function MA:_SpeakRaw(text, spellID)
+function MA:_SpeakRaw(text, spellID, chargeCount)
     if not self.db or not self.db.enabled then return end
     if not self.db.alertInCombat and InCombatLockdown() then return end
-    self.lastAlertTime[text] = GetTime()
     local data = spellID and self.charDb.trackedSpells[spellID]
+    if not self:IsAlertAllowedInCurrentContext(data) then return end
+    self.lastAlertTime[text] = GetTime()
+    local chargePrefix = ""
+    if chargeCount and chargeCount > 0 then
+        chargePrefix = tostring(chargeCount) .. " "
+    end
     local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
         local ttsText = (type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil
-        self:_QueueTTS(ttsText or text)
+        self:_QueueTTS(chargePrefix .. (ttsText or text))
     elseif mode ~= "none" then
         self:PlaySoundByKey((type(data) == "table" and data.sound) or "RaidWarning")
     end
     if self.db.showVisual then
         local visText = (type(data) == "table" and data.displayText ~= "" and data.displayText) or text
-        self:ShowAlertText(self:GetAlertColorHex() .. visText .. "|r", spellID, nil)
+        self:ShowAlertText(self:GetAlertColorHex() .. chargePrefix .. visText .. "|r", spellID, nil)
     end
 end
 
@@ -1192,6 +1948,12 @@ function MA:SpeakItem(text, itemID)
     if not self.db or not self.db.enabled then return end
     if not self.db.alertInCombat and InCombatLockdown() then return end
 
+    local data = itemID and self.charDb.trackedItems[itemID]
+    if not self:IsAlertAllowedInCurrentContext(data) then
+        if self.debugMode then print("|cffff0000MochaAlerts DBG:|r Blocked - item context filter") end
+        return
+    end
+
     local now = GetTime()
     if self.lastAlertTime[text] and (now - self.lastAlertTime[text]) < ALERT_THROTTLE then
         if self.debugMode then print("|cffff8800MochaAlerts DBG:|r Throttled item alert for '" .. text .. "'") end
@@ -1201,16 +1963,16 @@ function MA:SpeakItem(text, itemID)
 
     if self.debugMode then print("|cff00ff00MochaAlerts DBG:|r >>> " .. text) end
 
-    local mode = self:GetItemMode(itemID)
+    local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
-        local ttsText = self:GetItemTTSText(itemID)
+        local ttsText = (type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil
         self:_QueueTTS(ttsText or text)
     elseif mode ~= "none" then
-        self:PlaySoundByKey(self:GetItemSound(itemID))
+        self:PlaySoundByKey((type(data) == "table" and data.sound) or "RaidWarning")
     end
 
     if self.db.showVisual then
-        local visText = self:GetItemDisplayText(itemID) or text
+        local visText = (type(data) == "table" and data.displayText ~= "" and data.displayText) or text
         self:ShowAlertText(self:GetAlertColorHex() .. visText .. "|r", nil, itemID)
     end
 
@@ -1224,15 +1986,17 @@ end
 function MA:_SpeakItemRaw(text, itemID)
     if not self.db or not self.db.enabled then return end
     if not self.db.alertInCombat and InCombatLockdown() then return end
+    local data = itemID and self.charDb.trackedItems[itemID]
+    if not self:IsAlertAllowedInCurrentContext(data) then return end
     self.lastAlertTime[text] = GetTime()
-    local mode = self:GetItemMode(itemID)
+    local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
-        self:_QueueTTS(self:GetItemTTSText(itemID) or text)
+        self:_QueueTTS(((type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil) or text)
     elseif mode ~= "none" then
-        self:PlaySoundByKey(self:GetItemSound(itemID))
+        self:PlaySoundByKey((type(data) == "table" and data.sound) or "RaidWarning")
     end
     if self.db.showVisual then
-        local visText = (itemID and self:GetItemDisplayText(itemID)) or text
+        local visText = (type(data) == "table" and data.displayText ~= "" and data.displayText) or text
         self:ShowAlertText(self:GetAlertColorHex() .. visText .. "|r", nil, itemID)
     end
 end
@@ -1501,7 +2265,7 @@ function MA:OnChargeRecovered(baseSpellID)
             if self.debugMode then
                 print("|cffaa88ffMochaAlerts DBG:|r Charge recovered (timer): " .. spellName .. " (" .. prev .. " -> " .. newCount .. "/" .. maxCharges .. ")")
             end
-            self:Speak(spellName .. " ready", baseSpellID)
+            self:Speak(spellName .. " ready", baseSpellID, nil, newCount)
         end
     end
 
@@ -1692,7 +2456,7 @@ function MA:CheckUsability(baseSpellID, activeID)
                             if self.debugMode then
                                 print("|cffaa88ffMochaAlerts DBG:|r Charge recovered: " .. spellName .. " (" .. prevCount .. " -> " .. cur .. "/" .. maxCharges .. ")")
                             end
-                            self:Speak(spellName .. " ready", baseSpellID)
+                            self:Speak(spellName .. " ready", baseSpellID, nil, cur)
                         end
                     end
                 end
@@ -2713,6 +3477,16 @@ frame:SetScript("OnEvent", function(_, event, ...)
                     end
                 end
             end
+            -- Migrate per-character minimap angle to account-wide LibDBIcon position
+            if MochaAlertsCharDB and MochaAlertsCharDB.minimapAngle then
+                MA.db.minimap = MA.db.minimap or {}
+                MA.db.minimap.minimapPos = MochaAlertsCharDB.minimapAngle
+                MochaAlertsCharDB.minimapAngle = nil
+            end
+
+            -- Register minimap button with LibDBIcon
+            LibStub("LibDBIcon-1.0"):Register("MochaAlerts", MochaAlertsLDB, MA.db.minimap)
+
             frame:UnregisterEvent("ADDON_LOADED")
         end
 
@@ -2745,7 +3519,10 @@ frame:SetScript("OnEvent", function(_, event, ...)
                 end
             end
         end)
-        print("|cff00ff00MochaAlerts|r v1.2.2 loaded. Type |cff88bbff/malerts|r to configure.")
+        local loadedVersion = (C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(addonName, "Version")) or "unknown"
+    if not MA.db.quietLogin then
+        print("|cff00ff00MochaAlerts|r v" .. loadedVersion .. " loaded. Type |cff88bbff/malerts|r to configure.")
+    end
 
         -- Register in the in-game Addon settings list
         if Settings and Settings.RegisterCanvasLayoutCategory then
@@ -2789,7 +3566,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             local ver = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
             ver:SetPoint("LEFT", openBtn, "RIGHT", 12, 0)
             ver:SetTextColor(0.65, 0.52, 0.38)
-            local versionStr = (C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(addonName, "Version")) or "1.2.2"
+            local versionStr = (C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(addonName, "Version")) or "unknown"
             ver:SetText("v" .. versionStr)
 
             local category = Settings.RegisterCanvasLayoutCategory(panel, "MochaAlerts")
