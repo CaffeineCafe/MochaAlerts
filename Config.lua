@@ -389,6 +389,8 @@ function MA:CreateConfigFrame()
     MakeCheckbox(f, PAD, y, "Enable alerts", MA.db.enabled, function(v) MA.db.enabled = v end)
     y = y - 24
     MakeCheckbox(f, PAD, y, "Alert during combat", MA.db.alertInCombat, function(v) MA.db.alertInCombat = v end)
+    y = y - 24
+    MakeCheckbox(f, PAD, y, "Suppress login message", MA.db.quietLogin, function(v) MA.db.quietLogin = v end)
 
     -- Poll interval (compact, right-aligned next to checkboxes)
     local pollLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
