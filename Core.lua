@@ -1087,6 +1087,8 @@ function MA:ShowAlertText(msg, spellID, itemID, forcedIconTexture)
             local iconOffsetX, iconOffsetY = 0, 0
             local textScale = 1.0
             local textOffsetX, textOffsetY = 0, 0
+            local frameScale = f.targetScale or 1.0
+            if frameScale <= 0 then frameScale = 1.0 end
             
             if spellID then
                 iconScale = self:GetSpellIconScale(spellID)
@@ -1105,15 +1107,15 @@ function MA:ShowAlertText(msg, spellID, itemID, forcedIconTexture)
             end
             
             -- Position icon independently against the screen, not the base alert anchor.
-            f.icon:SetPoint("CENTER", UIParent, "CENTER", iconOffsetX, iconOffsetY)
-            local iconSize = math.max(12, math.floor(ALERT_ICON_BASE_SIZE * iconScale + 0.5))
+            f.icon:SetPoint("CENTER", UIParent, "CENTER", iconOffsetX / frameScale, iconOffsetY / frameScale)
+            local iconSize = math.max(12, math.floor((ALERT_ICON_BASE_SIZE * iconScale) / frameScale + 0.5))
             f.icon:SetSize(iconSize, iconSize)
             
             -- Position text with independent scale and offset
             if showText then
                 f.text:ClearAllPoints()
-                f.text:SetPoint("CENTER", UIParent, "CENTER", textOffsetX, textOffsetY)
-                local fontSize = math.max(8, math.floor(ALERT_TEXT_BASE_SIZE * textScale + 0.5))
+                f.text:SetPoint("CENTER", UIParent, "CENTER", textOffsetX / frameScale, textOffsetY / frameScale)
+                local fontSize = math.max(8, math.floor((ALERT_TEXT_BASE_SIZE * textScale) / frameScale + 0.5))
                 f.text:SetFont(self:GetAlertFontPath(), fontSize, "OUTLINE")
             end
         end
@@ -1134,6 +1136,8 @@ function MA:ShowAlertText(msg, spellID, itemID, forcedIconTexture)
             else
                 local textScale = 1.0
                 local textOffsetX, textOffsetY = 0, 0
+                local frameScale = f.targetScale or 1.0
+                if frameScale <= 0 then frameScale = 1.0 end
                 if spellID then
                     textScale = self:GetSpellTextScale(spellID)
                     textOffsetX = self:GetSpellTextOffsetX(spellID)
@@ -1143,8 +1147,8 @@ function MA:ShowAlertText(msg, spellID, itemID, forcedIconTexture)
                     textOffsetX = self:GetItemTextOffsetX(itemID)
                     textOffsetY = self:GetItemTextOffsetY(itemID)
                 end
-                f.text:SetPoint("CENTER", UIParent, "CENTER", textOffsetX, textOffsetY)
-                local fontSize = math.max(8, math.floor(ALERT_TEXT_BASE_SIZE * textScale + 0.5))
+                f.text:SetPoint("CENTER", UIParent, "CENTER", textOffsetX / frameScale, textOffsetY / frameScale)
+                local fontSize = math.max(8, math.floor((ALERT_TEXT_BASE_SIZE * textScale) / frameScale + 0.5))
                 f.text:SetFont(self:GetAlertFontPath(), fontSize, "OUTLINE")
             end
         end
@@ -1898,8 +1902,8 @@ function MA:Speak(text, spellID, forcedIconTexture, chargeCount)
     -- Per-spell mode and custom TTS text (single table lookup)
     local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
-        local ttsText = (type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil
-        self:_QueueTTS(chargePrefix .. (ttsText or text))
+        local ttsText = spellID and self:GetSpellTTSText(spellID) or nil
+        self:_QueueTTS(ttsText or (chargePrefix .. text))
     elseif mode ~= "none" then
         local soundKey = (type(data) == "table" and data.sound) or "RaidWarning"
         self:PlaySoundByKey(soundKey)
@@ -1930,8 +1934,8 @@ function MA:_SpeakRaw(text, spellID, chargeCount)
     end
     local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
-        local ttsText = (type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil
-        self:_QueueTTS(chargePrefix .. (ttsText or text))
+        local ttsText = spellID and self:GetSpellTTSText(spellID) or nil
+        self:_QueueTTS(ttsText or (chargePrefix .. text))
     elseif mode ~= "none" then
         self:PlaySoundByKey((type(data) == "table" and data.sound) or "RaidWarning")
     end
