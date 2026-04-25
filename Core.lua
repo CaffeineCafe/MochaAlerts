@@ -4,6 +4,9 @@
 local GetTime = GetTime
 local InCombatLockdown = InCombatLockdown
 local IsPlayerSpell = IsPlayerSpell
+local IsInInstance = IsInInstance
+local IsInRaid = IsInRaid
+local IsInGroup = IsInGroup
 local C_Spell = C_Spell
 local C_Timer = C_Timer
 local pairs = pairs
@@ -402,8 +405,11 @@ end
 
 function MA:GetSpellTTSText(spellID)
     local data = self.charDb.trackedSpells[spellID]
-    if type(data) == "table" and data.ttsText and data.ttsText ~= "" then
-        return data.ttsText
+    if type(data) == "table" and data.ttsText then
+        local t = strtrim(tostring(data.ttsText))
+        if t ~= "" then
+            return t
+        end
     end
     return nil  -- nil means use default "SpellName ready"
 end
@@ -413,7 +419,8 @@ function MA:SetSpellTTSText(spellID, text)
     if type(data) ~= "table" then
         data = { mode = "tts", sound = "RaidWarning" }
     end
-    data.ttsText = (text and text ~= "") and text or nil
+    local normalized = text and strtrim(tostring(text)) or ""
+    data.ttsText = (normalized ~= "") and normalized or nil
     self.charDb.trackedSpells[spellID] = data
 end
 
@@ -472,11 +479,13 @@ end
 
 function MA:GetItemTTSText(itemID)
     local data = self.charDb.trackedItems[itemID]
-    if type(data) ~= "table" or not data.ttsText or data.ttsText == "" then return nil end
+    if type(data) ~= "table" or not data.ttsText then return nil end
+    local t = strtrim(tostring(data.ttsText))
+    if t == "" then return nil end
     -- Ignore the old auto-set default for health pot groups so the editbox
     -- always shows the grey placeholder until the user types something.
-    if data.isHealthPotGroup and data.ttsText == "Health Pot" then return nil end
-    return data.ttsText
+    if data.isHealthPotGroup and t == "Health Pot" then return nil end
+    return t
 end
 
 -- Centralised display name for tracked items.  Honours all group types.
@@ -492,7 +501,8 @@ end
 function MA:SetItemTTSText(itemID, text)
     local data = self.charDb.trackedItems[itemID]
     if type(data) ~= "table" then data = { mode = "tts", sound = "RaidWarning" } end
-    data.ttsText = (text and text ~= "") and text or nil
+    local normalized = text and strtrim(tostring(text)) or ""
+    data.ttsText = (normalized ~= "") and normalized or nil
     self.charDb.trackedItems[itemID] = data
 end
 
@@ -815,12 +825,15 @@ end
 
 function MA:GetCurrentAlertContext()
     local _, instanceType, difficultyID = GetInstanceInfo()
+    local inInstance = IsInInstance()
 
     if instanceType == "pvp" or instanceType == "arena" then
         return "pvp"
     end
 
-    if instanceType == "party" then
+    -- Some queued/instanced PvE content can report as "scenario" in modern
+    -- Retail. Treat it as 5-man content for filtering purposes.
+    if instanceType == "party" or instanceType == "scenario" then
         return "fiveMan"
     end
 
@@ -829,6 +842,19 @@ function MA:GetCurrentAlertContext()
             return "mythicRaid"
         end
         return "raid"
+    end
+
+    -- Fallbacks: if the instanceType is unexpected, infer from group state.
+    if inInstance then
+        if IsInRaid() then
+            if MYTHIC_RAID_DIFFICULTY_IDS[difficultyID] then
+                return "mythicRaid"
+            end
+            return "raid"
+        end
+        if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) or IsInGroup() then
+            return "fiveMan"
+        end
     end
 
     return nil
@@ -841,7 +867,9 @@ function MA:IsAlertAllowedInCurrentContext(data)
 
     local currentContext = self:GetCurrentAlertContext()
     if not currentContext then
-        return false
+        -- Fail open when the current context cannot be classified.
+        -- This avoids suppressing alerts due to unexpected instanceType values.
+        return true
     end
 
     local field = ALERT_CONTEXT_FIELDS[currentContext]
@@ -1671,27 +1699,42 @@ function MA:GetSelectedVoice()
 end
 
 function MA:TryTTS(text)
-    local voice = self:GetSelectedVoice()
-    -- Method 1: TextToSpeech_Speak with the actual voice OBJECT (not ID)
-    if TextToSpeech_Speak and voice then
-        local ok, err = pcall(TextToSpeech_Speak, text, voice)
-        if self.debugMode then
-            print("|cff00ff00MochaAlerts DBG:|r TTS Method1 (TextToSpeech_Speak + voiceObj): ok=" .. tostring(ok) .. " err=" .. tostring(err))
+    local function tryWithVoice(voice)
+        -- Method 1: TextToSpeech_Speak with the actual voice OBJECT (not ID)
+        if TextToSpeech_Speak and voice then
+            local ok, result = pcall(TextToSpeech_Speak, text, voice)
+            if self.debugMode then
+                print("|cff00ff00MochaAlerts DBG:|r TTS Method1 (TextToSpeech_Speak + voiceObj): ok=" .. tostring(ok) .. " result=" .. tostring(result))
+            end
+            -- Treat explicit false as failure; nil/true both considered accepted by API.
+            if ok and result ~= false then
+                return true
+            end
         end
-        if ok then return true end
+
+        -- Method 2: Direct C_VoiceChat.SpeakText with voice object's voiceID
+        if C_VoiceChat and C_VoiceChat.SpeakText then
+            local vid = (voice and voice.voiceID) or 0
+            local ok, result = pcall(C_VoiceChat.SpeakText, vid, text, 0, 0, 100)
+            if self.debugMode then
+                print("|cff00ff00MochaAlerts DBG:|r TTS Method2 (SpeakText vid=" .. tostring(vid) .. "): ok=" .. tostring(ok) .. " result=" .. tostring(result))
+            end
+            if ok and result ~= false then
+                return true
+            end
+        end
+
+        return false
     end
 
-    -- Method 2: Direct C_VoiceChat.SpeakText with voice object's voiceID
-    if C_VoiceChat and C_VoiceChat.SpeakText then
-        local vid = voice and voice.voiceID or 0
-        local ok, err = pcall(C_VoiceChat.SpeakText, vid, text, 0, 0, 100)
-        if self.debugMode then
-            print("|cff00ff00MochaAlerts DBG:|r TTS Method2 (SpeakText vid=" .. vid .. "): ok=" .. tostring(ok) .. " err=" .. tostring(err))
-        end
-        if ok then return true end
+    if tryWithVoice(self:GetSelectedVoice()) then
+        return true
     end
 
-    return false
+    -- Voice objects can go stale across client state changes; refresh once and retry.
+    self:GetTTSVoices(true)
+    self._cachedSelectedVoice = nil
+    return tryWithVoice(self:GetSelectedVoice())
 end
 
 function MA:DiagnoseTTS()
@@ -1823,6 +1866,11 @@ end
 -- simultaneous bursts ("Void Ray, Collapsing Star").
 -------------------------------------------------------------------------------
 function MA:_QueueTTS(text)
+    -- Safety: recover from a stale pending state if a timer callback was missed.
+    if self.ttsFlushPending and self._ttsPendingSince and (GetTime() - self._ttsPendingSince) > 0.35 then
+        self.ttsFlushPending = false
+    end
+
     tinsert(self.ttsQueue, text)
     if not self.ttsFlushPending then
         -- First alert in this burst: speak it NOW (zero latency).
@@ -1830,6 +1878,7 @@ function MA:_QueueTTS(text)
         -- before the timer fires, we stop the first speech and re-speak
         -- the combined string.
         self.ttsFlushPending = true
+        self._ttsPendingSince = GetTime()
         self:_FlushTTSQueue(true)  -- true = immediate flush (keep window open)
         C_Timer.After(TTS_COALESCE_WINDOW, function()
             if #MA.ttsQueue > 0 then
@@ -1837,20 +1886,20 @@ function MA:_QueueTTS(text)
                 MA:_FlushTTSQueue(false)
             else
                 MA.ttsFlushPending = false
+                MA._ttsPendingSince = nil
             end
         end)
     else
         -- A second (or third) alert arrived while the coalesce window is open.
-        -- Stop the in-progress single speech so the timer re-speaks combined.
-        if C_VoiceChat and C_VoiceChat.StopSpeakingText then
-            pcall(C_VoiceChat.StopSpeakingText)
-        end
+        -- Do not interrupt active speech here; some clients can stall TTS
+        -- after StopSpeakingText calls. Let the scheduled flush handle queueing.
     end
 end
 
 function MA:_FlushTTSQueue(keepWindow)
     if not keepWindow then
         self.ttsFlushPending = false
+        self._ttsPendingSince = nil
     end
     if #self.ttsQueue == 0 then return end
     local combined = tconcat(self.ttsQueue, ", ")
@@ -1969,7 +2018,7 @@ function MA:SpeakItem(text, itemID)
 
     local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
-        local ttsText = (type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil
+        local ttsText = itemID and self:GetItemTTSText(itemID) or nil
         self:_QueueTTS(ttsText or text)
     elseif mode ~= "none" then
         self:PlaySoundByKey((type(data) == "table" and data.sound) or "RaidWarning")
@@ -1995,7 +2044,7 @@ function MA:_SpeakItemRaw(text, itemID)
     self.lastAlertTime[text] = GetTime()
     local mode = (type(data) == "table" and data.mode) or "tts"
     if mode == "tts" then
-        self:_QueueTTS(((type(data) == "table" and data.ttsText ~= "" and data.ttsText) or nil) or text)
+        self:_QueueTTS((itemID and self:GetItemTTSText(itemID)) or text)
     elseif mode ~= "none" then
         self:PlaySoundByKey((type(data) == "table" and data.sound) or "RaidWarning")
     end
