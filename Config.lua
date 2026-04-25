@@ -690,7 +690,7 @@ function MA:CreateConfigFrame()
     apDesc:SetWidth(FRAME_W - 80)
     apDesc:SetJustifyH("CENTER")
     apDesc:SetTextColor(0.88, 0.78, 0.62)
-    apDesc:SetText("Plays voice alerts and sounds when your tracked\nspells and items come off cooldown and are ready to cast.\nVersion 1.3.1 refines unlinked positioning and\ncharged-spell TTS behavior.")
+    apDesc:SetText("Plays voice alerts and sounds when your tracked\nspells and items come off cooldown and are ready to cast.\nVersion 1.3.2 improves context filtering reliability\nand TTS stability on 12.0.5.")
 
     local apHow = aboutPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     apHow:SetPoint("TOP", apDesc, "BOTTOM", 0, -8)
@@ -717,7 +717,7 @@ function MA:CreateConfigFrame()
         "|cffEDD9A3[x2]|r  Repeat the alert a second time after 1.5s\n" ..
         "|cffEDD9A3[Tt]|r  Set a custom on-screen text for this alert\n" ..
         "|cffEDD9A3[X]|r  Remove this spell or item from tracking\n\n" ..
-        "|cffEDD9A3[click alert icon]|r  Open the v1.3.1 customization flyout\n" ..
+        "|cffEDD9A3[click alert icon]|r  Open the v1.3.2 customization flyout\n" ..
         "|cffEDD9A3[Switch To Unlinked]|r  Separate icon and text placement\n" ..
         "|cffEDD9A3[Unlock & Drag]|r  Open dimmed screen placement mode"
     )

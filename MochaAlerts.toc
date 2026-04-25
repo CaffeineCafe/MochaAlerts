@@ -2,7 +2,7 @@
 ## Title: |cffD4A96AMocha|r|cffEDD9A3Alerts|r
 ## Notes: Voice alerts when tracked spells come off cooldown and are ready to cast
 ## Author: CaffeineCafe
-## Version: 1.3.1
+## Version: 1.3.2
 ## SavedVariables: MochaAlertsDB
 ## SavedVariablesPerCharacter: MochaAlertsCharDB
 ## IconTexture: Interface\AddOns\MochaAlerts\Media\Textures\coffeeAlert
